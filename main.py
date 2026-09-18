@@ -9,6 +9,7 @@ from tavily import TavilyClient
 from google import genai
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from upstash_redis import Redis
 
 load_dotenv()
 
@@ -17,7 +18,13 @@ app = FastAPI(title="Barcainspo AI Engine")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-CACHE_FILE = "match_cache.json"
+# Inisialisasi Upstash Redis dari Environment Variables Vercel
+REDIS_URL = os.getenv("KV_REST_API_URL")
+REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
+
+redis_client = None
+if REDIS_URL and REDIS_TOKEN:
+    redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,24 +37,32 @@ app.add_middleware(
 client = genai.Client(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# Helper untuk membaca cache lokal
+# Helper untuk membaca cache dari Upstash Redis
 def load_cache():
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
+    if not redis_client:
+        return None
+    try:
+        data = redis_client.get("match_cache")
+        if data:
+            if isinstance(data, str):
+                return json.loads(data)
+            return data
+    except Exception as e:
+        print(f"[Redis Load Error] Gagal membaca cache: {e}")
     return None
 
-# Helper untuk menyimpan data ke cache lokal
+# Helper untuk menyimpan data ke Upstash Redis
 def save_cache(data, expires_at: datetime):
-    cache_payload = {
-        "expires_at": expires_at.isoformat(),
-        "data": data
-    }
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache_payload, f, indent=2)
+    if not redis_client:
+        return
+    try:
+        cache_payload = {
+            "expires_at": expires_at.isoformat(),
+            "data": data
+        }
+        redis_client.set("match_cache", json.dumps(cache_payload))
+    except Exception as e:
+        print(f"[Redis Save Error] Gagal menyimpan cache: {e}")
 
 # Helper pengambilan logo dinamis dari TheSportsDB
 def get_team_logo_dynamic(team_name: str) -> str:
@@ -82,7 +97,7 @@ async def get_next_match():
         now = datetime.now()
         cache = load_cache()
 
-        # 1. CEK CACHE: Jika cache ada dan waktu sekarang belum melewati batas expired
+        # 1. CEK CACHE REDIS
         if cache and "expires_at" in cache:
             try:
                 expires_at = datetime.fromisoformat(cache["expires_at"])
@@ -161,16 +176,13 @@ async def get_next_match():
             if match_iso_str:
                 kickoff_dt = datetime.fromisoformat(match_iso_str)
             else:
-                # Fallback jika Gemini lupa format match_iso: set default 24 jam dari sekarang
                 kickoff_dt = now + timedelta(hours=24)
             
-            # Waktu expired diset 3 jam setelah kick-off
             expires_at = kickoff_dt + timedelta(hours=3)
         except Exception:
-            # Fallback jika parsing tanggal gagal
             expires_at = now + timedelta(hours=12)
 
-        # 4. SIMPAN HASIL KE FILE CACHE
+        # 4. SIMPAN HASIL KE REDIS
         save_cache(parsed_data, expires_at)
         
         return {

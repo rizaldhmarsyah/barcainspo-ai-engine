@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-tavily-python
 google-genai
+tavily-python
 python-dotenv
+upstash-redis
