@@ -107,8 +107,8 @@ async def get_next_match():
 
         current_date_str = now.strftime("%d %B %Y")
         
-        # Query dibuat dinamis & spesifik meminta jadwal WIB / Indonesia
-        search_query = f"FC Barcelona next match fixture schedule kick off time WIB Indonesia after {current_date_str}"
+        # Query difokuskan mencari jadwal bahasa Indonesia/WIB langsung
+        search_query = f"jadwal pertandingan FC Barcelona mendatang jam kick off WIB Indonesia setelah {current_date_str}"
         
         search_result = await asyncio.to_thread(
             tavily.search,
@@ -120,31 +120,32 @@ async def get_next_match():
         raw_text = "\n\n".join([f"Source ({item.get('url')}):\n{item.get('content')}" for item in results])
         
         prompt = f"""
-        Hari ini adalah tanggal {current_date_str} (WIB / UTC+7).
-        
-        Tugas utama kamu adalah mengekstrak jadwal pertandingan resmi FC Barcelona terdekat berikutnya yang BELUM dimainkan (setelah tanggal {current_date_str}).
-        
-        Berikut adalah data mentah hasil pencarian:
+        Hari ini adalah tanggal {current_date_str}.
+
+        Tugasmu adalah mencari dan menentukan jadwal pertandingan resmi FC Barcelona (tim utama pria) terdekat berikutnya yang BELUM DIMAINKAN (setelah tanggal {current_date_str}).
+
+        Berikut adalah data hasil pencarian web:
         ---
         {raw_text}
         ---
 
-        ATURAN WAKTU & ZONA WAKTU (SANGAT PENTING):
-        1. Cari jam kick-off dan konversikan secara akurat ke Waktu Indonesia Barat (WIB / UTC+7).
-           - Catatan: Waktu lokal Spanyol (CEST) adalah UTC+2. Jadi Waktu WIB = Waktu Spanyol + 5 jam.
-           - Contoh: Jika di Spanyol main jam 21:00 CEST tanggal 19 September, maka di WIB adalah jam 02:00 WIB tanggal 20 September.
-        2. Format tanggal harus disesuaikan dengan hari di Indonesia (WIB) setelah konversi jam.
-        3. Field "time" diisi format jam persis (contoh: "02:00 WIB" atau "21:15 WIB").
-        4. Field "match_iso" diisi format ISO 8601 lengkap berdasarkan waktu WIB (contoh: "2026-09-20T02:00:00").
-        5. Jika jam belum dikonfirmasi resmi oleh operator liga (TBD), perkirakan jadwal resmi malam Spanyol (biasanya 21:00 CEST / 02:00 WIB hari berikutnya).
+        ATURAN WAKTU & ZONA WAKTU (SANGAT KRUSIAL):
+        1. Utamakan ekstrak jam kick-off dalam Waktu Indonesia Barat (WIB).
+        2. Jika data dalam teks pencarian menggunakan waktu Spanyol (CEST/CET) atau UTC, lakukan konversi akurat ke WIB:
+           - Waktu WIB = Waktu Spanyol (CEST) + 5 Jam.
+           - Contoh 1: Jam 18:30 CEST Spanyol = 23:30 WIB (hari yang sama).
+           - Contoh 2: Jam 21:00 CEST Spanyol = 02:00 WIB (hari berikutnya).
+        3. Pastikan penulisan tanggal disesuaikan dengan tanggal di Indonesia (WIB) setelah jam dikonversi.
+        4. Field "time" diisi jam WIB persis (contoh: "23:30 WIB" atau "02:00 WIB").
+        5. Field "match_iso" diisi format ISO 8601 standar waktu WIB (contoh: "2026-10-10T23:30:00").
 
-        Kembalikan HANYA JSON murni dengan format:
+        Kembalikan HANYA JSON murni dengan struktur berikut:
         {{
-            "opponent": "Nama Lawan",
-            "date": "Tanggal dalam WIB (contoh: 20 September 2026)",
-            "time": "Jam WIB (contoh: 02:00 WIB)",
+            "opponent": "Nama Lawan (contoh: Getafe CF)",
+            "date": "Tanggal dalam WIB (contoh: 10 Oktober 2026)",
+            "time": "Jam WIB (contoh: 23:30 WIB)",
             "match_iso": "YYYY-MM-DDTHH:MM:SS",
-            "competition": "Nama Kompetisi (contoh: La Liga / Champions League)",
+            "competition": "Nama Kompetisi (contoh: La Liga)",
             "venue": "Home atau Away"
         }}
         """
@@ -165,7 +166,7 @@ async def get_next_match():
             )
         
         parsed_data = json.loads(response.text)
-        opponent_name = parsed_data.get("opponent", "Sevilla")
+        opponent_name = parsed_data.get("opponent", "Getafe")
         
         opponent_logo_url = await asyncio.to_thread(get_team_logo_dynamic, opponent_name)
         
