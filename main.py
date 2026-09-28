@@ -1,4 +1,7 @@
-#barcaispo-ai-engine/main.py
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
+
 import asyncio
 from datetime import datetime, timedelta
 import json
@@ -10,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from google import genai
+from groq import Groq
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis
@@ -20,6 +24,7 @@ app = FastAPI(title="Barcainspo AI Engine")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 REDIS_URL = os.getenv("KV_REST_API_URL")
 REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
@@ -38,6 +43,88 @@ app.add_middleware(
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+# ==========================================
+# HELPER CALL WITH MULTI-STAGE GROQ FALLBACK
+# ==========================================
+async def call_groq_fallback(prompt: str) -> str:
+    """Fallback ke model Groq yang terkonfirmasi aktif di akun."""
+    if not GROQ_API_KEY or not groq_client:
+        raise Exception("GROQ_API_KEY belum terpasang atau tidak valid di file .env")
+
+    # Model Groq terkonfirmasi aktif
+    groq_models = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b"
+    ]
+
+    for model_name in groq_models:
+        try:
+            print(f"[Groq Fallback] Memproses request dengan model: {model_name}...")
+            completion = await asyncio.to_thread(
+                groq_client.chat.completions.create,
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta, tanpa markdown triple backticks (```json)."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            return completion.choices[0].message.content
+        except Exception as err:
+            print(f"[Groq Warning] Model {model_name} gagal: {err}")
+
+    raise Exception("Seluruh model Groq gagal merespons.")
+
+
+async def call_gemini_with_fallback(prompt: str) -> str:
+    """
+    1. Coba gemini-3.8-flash (Retry 3x jika hit 503 Overloaded)
+    2. Jika Gemini gagal/busy, pindah otomatis ke Groq Fallback
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"[Gemini Request] Memanggil gemini-3.8-flash (Percobaan {attempt + 1})...")
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.8-flash",
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            return response.text
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[Gemini Warning] gemini-3.8-flash percobaan {attempt + 1} gagal: {err_msg}")
+            
+            # Jika 503 Overloaded, tunggu 2 detik dan coba lagi
+            if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                if attempt < max_retries - 1:
+                    print("[Gemini] Server sibuk (503), menunggu 2 detik...")
+                    await asyncio.sleep(2)
+                    continue
+
+    # Jika Gemini gagal 3x, eksekusi Groq
+    print("[Gemini Failed] Gemini sibuk/error. Dialihkan ke Groq...")
+    try:
+        return await call_groq_fallback(prompt)
+    except Exception as groq_err:
+        print(f"[Groq Error] Gagal memproses via Groq: {groq_err}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Semua Provider AI (Gemini & Groq) gagal merespons: {str(groq_err)}"
+        )
+
 
 # ==========================================
 # PYDANTIC SCHEMAS UNTUK AI ARTICLE GENERATOR
@@ -46,7 +133,7 @@ class ArticleGenerateRequest(BaseModel):
     prompt: str
     topic: Optional[str] = None
     category: Optional[str] = "First Team"
-    mode: Optional[str] = "generate"  # mode: 'generate' | 'rewrite' | 'expand'
+    mode: Optional[str] = "generate"
 
 class ArticleGenerateResponse(BaseModel):
     title: str = Field(description="Judul artikel menarik SEO maks 110 karakter")
@@ -57,6 +144,16 @@ class ArticleGenerateResponse(BaseModel):
     altText: str = Field(description="Alt text deskriptif untuk gambar cover")
     imageCredit: str = Field(description="Sumber/kredit foto")
     tags: str = Field(description="Tag dipisahkan koma, contoh: FC Barcelona, Hansi Flick, La Liga")
+
+class FieldRefineRequest(BaseModel):
+    field_type: str
+    current_value: str
+    instruction: str
+    topic: Optional[str] = None
+
+class FieldRefineResponse(BaseModel):
+    options: list[str] = Field(description="Daftar 3 variasi/revisi teks")
+
 
 # ==========================================
 # HELPER FUNCTIONS & CACHE
@@ -89,14 +186,14 @@ def save_cache(data, expires_at: datetime):
 def get_team_logo_dynamic(team_name: str) -> str:
     try:
         encoded_name = urllib.parse.quote(team_name)
-        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={encoded_name}"
+        url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
         
         req = urllib.request.Request(
             url, 
             headers={"User-Agent": "Mozilla/5.0"}
         )
         
-        with urllib.request.urlopen(req, timeout=4) as response:
+        with urllib.request.urlopen(req, timeout=3) as response:
             data = json.loads(response.read().decode())
             if data and data.get("teams") and len(data["teams"]) > 0:
                 badge_url = data["teams"][0].get("strBadge")
@@ -106,7 +203,8 @@ def get_team_logo_dynamic(team_name: str) -> str:
         print(f"[Logo Fetch Error] Gagal mengambil logo untuk {team_name}: {e}")
     
     encoded_fallback = urllib.parse.quote(team_name[:3].upper())
-    return f"https://ui-avatars.com/api/?name={encoded_fallback}&background=262626&color=ffffff&bold=true"
+    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=262626&color=ffffff&bold=true"
+
 
 # ==========================================
 # ENDPOINTS
@@ -177,22 +275,8 @@ async def get_next_match():
         }}
         """
         
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-        except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-        
-        parsed_data = json.loads(response.text)
+        raw_response = await call_gemini_with_fallback(prompt)
+        parsed_data = json.loads(raw_response)
         opponent_name = parsed_data.get("opponent", "")
 
         if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 30:
@@ -206,7 +290,7 @@ async def get_next_match():
 
         opponent_logo_url = await asyncio.to_thread(get_team_logo_dynamic, opponent_name)
         
-        parsed_data["barca_logo"] = "https://images.fotmob.com/image_resources/logo/teamlogo/8634.png"
+        parsed_data["barca_logo"] = "[https://images.fotmob.com/image_resources/logo/teamlogo/8634.png](https://images.fotmob.com/image_resources/logo/teamlogo/8634.png)"
         parsed_data["opponent_logo"] = opponent_logo_url
 
         try:
@@ -232,11 +316,9 @@ async def get_next_match():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 🎯 NEW ENDPOINT: GENERATE AI ARTICLE FOR EDITOR
 @app.post("/api/generate-article", response_model=ArticleGenerateResponse)
 async def generate_article(req: ArticleGenerateRequest):
     try:
-        # 1. Cari fakta terkini via Tavily jika topik/prompt memerlukan konteks berita terbaru
         search_query = f"FC Barcelona {req.topic or req.prompt} news 2026"
         search_result = await asyncio.to_thread(
             tavily.search,
@@ -247,7 +329,6 @@ async def generate_article(req: ArticleGenerateRequest):
         results = search_result.get("results", [])
         raw_context = "\n\n".join([f"Sumber ({item.get('url')}):\n{item.get('content')}" for item in results]) if results else "Tidak ada konteks berita tambahan."
 
-        # 2. Editorial Prompt & Format JSON SEO Constraint
         prompt = f"""
         Kamu adalah Redaktur Berita Senior & Pengamat Taktis Sepak Bola untuk portal berita 'barcainspo®'.
         
@@ -285,23 +366,8 @@ async def generate_article(req: ArticleGenerateRequest):
         }}
         """
 
-        # 3. Panggil Gemini Engine
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-        except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-
-        parsed_json = json.loads(response.text)
+        raw_response = await call_gemini_with_fallback(prompt)
+        parsed_json = json.loads(raw_response)
         return parsed_json
 
     except Exception as e:
@@ -309,19 +375,6 @@ async def generate_article(req: ArticleGenerateRequest):
         raise HTTPException(status_code=500, detail=f"Gagal memproses artikel AI: {str(e)}")
 
 
-# ==========================================
-# PYDANTIC SCHEMAS UNTUK REVISI / VARIASI
-# ==========================================
-class FieldRefineRequest(BaseModel):
-    field_type: str  # 'title' | 'excerpt' | 'content' | 'altText' | 'tags'
-    current_value: str
-    instruction: str
-    topic: Optional[str] = None
-
-class FieldRefineResponse(BaseModel):
-    options: list[str] = Field(description="Daftar 3 variasi/revisi teks")
-
-# 🎯 NEW ENDPOINT: REFINE / GENERATE VARIATIONS PER FIELD
 @app.post("/api/refine-field", response_model=FieldRefineResponse)
 async def refine_field(req: FieldRefineRequest):
     try:
@@ -354,22 +407,8 @@ async def refine_field(req: FieldRefineRequest):
         }}
         """
 
-        try:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.5-flash-lite",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-        except Exception:
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-
-        parsed_json = json.loads(response.text)
+        raw_response = await call_gemini_with_fallback(prompt)
+        parsed_json = json.loads(raw_response)
         return parsed_json
 
     except Exception as e:
