@@ -1,10 +1,13 @@
+#barcaispo-ai-engine/main.py
 import asyncio
 from datetime import datetime, timedelta
 import json
 import os
 import urllib.parse
 import urllib.request
+from typing import Optional
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from google import genai
 from dotenv import load_dotenv
@@ -36,6 +39,28 @@ app.add_middleware(
 client = genai.Client(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
+# ==========================================
+# PYDANTIC SCHEMAS UNTUK AI ARTICLE GENERATOR
+# ==========================================
+class ArticleGenerateRequest(BaseModel):
+    prompt: str
+    topic: Optional[str] = None
+    category: Optional[str] = "First Team"
+    mode: Optional[str] = "generate"  # mode: 'generate' | 'rewrite' | 'expand'
+
+class ArticleGenerateResponse(BaseModel):
+    title: str = Field(description="Judul artikel menarik SEO maks 110 karakter")
+    slug: str = Field(description="Slug URL kebab-case")
+    category: str = Field(description="Kategori berita")
+    excerpt: str = Field(description="Meta description SEO maks 160 karakter")
+    content: str = Field(description="Isi artikel multiparagraf dipisahkan dengan \\n\\n")
+    altText: str = Field(description="Alt text deskriptif untuk gambar cover")
+    imageCredit: str = Field(description="Sumber/kredit foto")
+    tags: str = Field(description="Tag dipisahkan koma, contoh: FC Barcelona, Hansi Flick, La Liga")
+
+# ==========================================
+# HELPER FUNCTIONS & CACHE
+# ==========================================
 def load_cache():
     if not redis_client:
         return None
@@ -83,6 +108,9 @@ def get_team_logo_dynamic(team_name: str) -> str:
     encoded_fallback = urllib.parse.quote(team_name[:3].upper())
     return f"https://ui-avatars.com/api/?name={encoded_fallback}&background=262626&color=ffffff&bold=true"
 
+# ==========================================
+# ENDPOINTS
+# ==========================================
 @app.get("/")
 def read_root():
     return {"status": "online", "message": "Engine AI Barcainspo siap digunakan!"}
@@ -106,8 +134,6 @@ async def get_next_match():
                 print(f"[Cache Read Error] Parsing ISO Format gagal: {e}")
 
         current_date_str = now.strftime("%d %B %Y")
-        
-        # Query Global Bahasa Inggris agar Tavily mendapatkan snippet akurat dari Goal/FotMob/LaLiga
         search_query = f"FC Barcelona next match schedule fixture date time kick off 2026 after {current_date_str}"
         
         search_result = await asyncio.to_thread(
@@ -169,7 +195,6 @@ async def get_next_match():
         parsed_data = json.loads(response.text)
         opponent_name = parsed_data.get("opponent", "")
 
-        # Validasi Keamanan Data (Jika AI mengembalikan teks error/tidak valid)
         if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 30:
             parsed_data["opponent"] = "Getafe CF"
             parsed_data["date"] = "10 Oktober 2026"
@@ -195,7 +220,6 @@ async def get_next_match():
         except Exception:
             expires_at = now + timedelta(hours=12)
 
-        # Simpan ke Redis hanya jika data valid
         save_cache(parsed_data, expires_at)
         
         return {
@@ -206,3 +230,148 @@ async def get_next_match():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# 🎯 NEW ENDPOINT: GENERATE AI ARTICLE FOR EDITOR
+@app.post("/api/generate-article", response_model=ArticleGenerateResponse)
+async def generate_article(req: ArticleGenerateRequest):
+    try:
+        # 1. Cari fakta terkini via Tavily jika topik/prompt memerlukan konteks berita terbaru
+        search_query = f"FC Barcelona {req.topic or req.prompt} news 2026"
+        search_result = await asyncio.to_thread(
+            tavily.search,
+            query=search_query,
+            max_results=4
+        )
+        
+        results = search_result.get("results", [])
+        raw_context = "\n\n".join([f"Sumber ({item.get('url')}):\n{item.get('content')}" for item in results]) if results else "Tidak ada konteks berita tambahan."
+
+        # 2. Editorial Prompt & Format JSON SEO Constraint
+        prompt = f"""
+        Kamu adalah Redaktur Berita Senior & Pengamat Taktis Sepak Bola untuk portal berita 'barcainspo®'.
+        
+        EDITORIAL VOICE GUIDELINES:
+        - Bahasa: Bahasa Indonesia formal, bergaya majalah berita olahraga premium.
+        - Tone: Analitis, lugas, mengalir, kaya istilah taktis (contoh: *high pressing*, *possession*, *pivot*, *half-space*).
+        - Judul: Menarik, SEO-friendly (MAKSIMAL 110 KARAKTER), tanpa clickbait murahan.
+        - Excerpt: Wajib padat, informatif, MAKSIMAL 160 KARAKTER untuk Google Search Meta Description.
+        - Alt Text: Deskriptif untuk keterbacaan SEO Google Image.
+
+        INPUT USER:
+        - Instruction/Prompt: {req.prompt}
+        - Topik Khusus: {req.topic or 'FC Barcelona'}
+        - Kategori Target: {req.category or 'First Team'}
+        - Mode: {req.mode}
+
+        BERITA & KONTEKS TERKINI (Tavily Search):
+        ---
+        {raw_context}
+        ---
+
+        TUGAS:
+        Buat artikel berita/analisis utuh berdasarkan kriteria di atas.
+
+        KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
+        {{
+            "title": "Judul Artikel (maksimal 110 karakter)",
+            "slug": "judul-artikel-dalam-kebab-case",
+            "category": "{req.category or 'First Team'}",
+            "excerpt": "Meta description singkat maksimal 160 karakter",
+            "content": "Paragraf 1\\n\\nParagraf 2\\n\\nParagraf 3",
+            "altText": "Deskripsi foto cover yang relevan dengan berita",
+            "imageCredit": "Getty Images / barcainspo®",
+            "tags": "FC Barcelona, Hansi Flick, La Liga"
+        }}
+        """
+
+        # 3. Panggil Gemini Engine
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+        except Exception:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.6-flash",
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+
+        parsed_json = json.loads(response.text)
+        return parsed_json
+
+    except Exception as e:
+        print(f"[Generate Article Error]: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal memproses artikel AI: {str(e)}")
+
+
+# ==========================================
+# PYDANTIC SCHEMAS UNTUK REVISI / VARIASI
+# ==========================================
+class FieldRefineRequest(BaseModel):
+    field_type: str  # 'title' | 'excerpt' | 'content' | 'altText' | 'tags'
+    current_value: str
+    instruction: str
+    topic: Optional[str] = None
+
+class FieldRefineResponse(BaseModel):
+    options: list[str] = Field(description="Daftar 3 variasi/revisi teks")
+
+# 🎯 NEW ENDPOINT: REFINE / GENERATE VARIATIONS PER FIELD
+@app.post("/api/refine-field", response_model=FieldRefineResponse)
+async def refine_field(req: FieldRefineRequest):
+    try:
+        prompt = f"""
+        Kamu adalah Redaktur Berita Senior portal 'barcainspo®'.
+        
+        TUGAS:
+        Berikan 3 variasi/revisi terbaik untuk komponen '{req.field_type}' artikel berita FC Barcelona.
+
+        NILAI SAAT INI:
+        "{req.current_value}"
+
+        INSTRUKSI REVISI / ARAHAN USER:
+        "{req.instruction}"
+
+        ATURAN KOMPONEN:
+        - Jika field 'title': Maksimal 110 karakter, menarik, SEO friendly.
+        - Jika field 'excerpt': Maksimal 160 karakter untuk Meta Description.
+        - Jika field 'content': Multiparagraf dipisahkan '\\n\\n', analitis taktis.
+        - Jika field 'altText': Deskriptif SEO gambar.
+        - Jika field 'tags': Pisahkan dengan koma.
+
+        KEMBALIKAN HANYA JSON MURNI DENGAN FORMAT:
+        {{
+            "options": [
+                "Variasi 1...",
+                "Variasi 2...",
+                "Variasi 3..."
+            ]
+        }}
+        """
+
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+        except Exception:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model="gemini-3.6-flash",
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+
+        parsed_json = json.loads(response.text)
+        return parsed_json
+
+    except Exception as e:
+        print(f"[Refine Field Error]: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal merevisi komponen: {str(e)}")
