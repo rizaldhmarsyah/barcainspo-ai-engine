@@ -1,25 +1,24 @@
-import warnings
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
-
-import asyncio
-from datetime import datetime, timedelta
-import json
 import os
 import re
+import json
+import asyncio
+import warnings
 import urllib.parse
 import urllib.request
 from typing import Optional
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from google import genai
 from groq import Groq
-from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from upstash_redis import Redis
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
 
 load_dotenv()
 
@@ -56,12 +55,9 @@ mistral_client = None
 if MISTRAL_API_KEY:
     try:
         from mistralai import Mistral
-
         mistral_client = Mistral(api_key=MISTRAL_API_KEY)
     except ImportError:
-        print(
-            "[Warning] Package 'mistralai' belum terinstall. Install via: pip install mistralai"
-        )
+        print("[Warning] Package 'mistralai' belum terinstall. Install via: pip install mistralai")
 
 
 def clean_json_string(text: str) -> str:
@@ -81,18 +77,13 @@ def clean_json_string(text: str) -> str:
 async def call_mistral_fallback(prompt: str) -> str:
     """Tier 3: Fallback paling akhir menggunakan Mistral AI."""
     if not MISTRAL_API_KEY or not mistral_client:
-        raise Exception(
-            "MISTRAL_API_KEY belum terpasang atau client Mistral tidak aktif."
-        )
+        raise Exception("MISTRAL_API_KEY belum terpasang atau client Mistral tidak aktif.")
 
-    # Prioritaskan open-mistral-7b yang terbukti sukses saat testing
     mistral_models = ["open-mistral-7b", "mistral-small-latest"]
 
     for model_name in mistral_models:
         try:
-            print(
-                f"[Mistral Fallback] Memproses request dengan model: {model_name}..."
-            )
+            print(f"[Mistral Fallback] Memproses request dengan model: {model_name}...")
             response = await asyncio.to_thread(
                 mistral_client.chat.complete,
                 model=model_name,
@@ -105,11 +96,7 @@ async def call_mistral_fallback(prompt: str) -> str:
                 ],
                 response_format={"type": "json_object"},
             )
-            if (
-                response
-                and response.choices
-                and response.choices[0].message.content
-            ):
+            if response and response.choices and response.choices[0].message.content:
                 return response.choices[0].message.content
         except Exception as err:
             print(f"[Mistral Warning] Model {model_name} gagal: {err}")
@@ -118,11 +105,10 @@ async def call_mistral_fallback(prompt: str) -> str:
 
 
 async def call_groq_fallback(prompt: str) -> str:
-    """Tier 2: Fallback ke model Groq yang terkonfirmasi aktif di dashboard."""
+    """Tier 2: Fallback ke model Groq."""
     if not GROQ_API_KEY or not groq_client:
         print("[Groq Skipped] GROQ_API_KEY belum terpasang.")
     else:
-        # Nama ID model Groq resmi hasil Auto-Discovery
         groq_models = [
             "openai/gpt-oss-120b",
             "openai/gpt-oss-20b",
@@ -132,9 +118,7 @@ async def call_groq_fallback(prompt: str) -> str:
 
         for model_name in groq_models:
             try:
-                print(
-                    f"[Groq Fallback] Memproses request dengan model: {model_name}..."
-                )
+                print(f"[Groq Fallback] Memproses request dengan model: {model_name}...")
                 completion = await asyncio.to_thread(
                     groq_client.chat.completions.create,
                     model=model_name,
@@ -153,29 +137,20 @@ async def call_groq_fallback(prompt: str) -> str:
             except Exception as err:
                 print(f"[Groq Warning] Model {model_name} gagal: {err}")
 
-    print(
-        "[Groq Failed] Semua model Groq gagal/di-skip. Dialihkan ke Mistral..."
-    )
+    print("[Groq Failed] Semua model Groq gagal/di-skip. Dialihkan ke Mistral...")
     return await call_mistral_fallback(prompt)
 
 
 async def call_gemini_with_fallback(prompt: str) -> str:
-    """Tier 1 -> Tier 2 -> Tier 3 AI Failover Flow:
-
-    1. Gemini (gemini-3.5-flash-lite -> gemini-3.8-flash)
-    2. Groq (openai/gpt-oss-120b -> openai/gpt-oss-20b -> qwen/qwen3.8-27b -> allam-2-7b)
-    3. Mistral (open-mistral-7b -> mistral-small-latest)
-    """
+    """Tier 1 -> Tier 2 -> Tier 3 AI Failover Flow."""
     if client and GEMINI_API_KEY:
-        gemini_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+        gemini_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
         for model_name in gemini_models:
             max_retries = 2
             for attempt in range(max_retries):
                 try:
-                    print(
-                        f"[Gemini Request] Memanggil {model_name} (Percobaan {attempt + 1})..."
-                    )
+                    print(f"[Gemini Request] Memanggil {model_name} (Percobaan {attempt + 1})...")
                     response = await asyncio.to_thread(
                         client.models.generate_content,
                         model=model_name,
@@ -186,26 +161,15 @@ async def call_gemini_with_fallback(prompt: str) -> str:
                         return response.text
                 except Exception as e:
                     err_msg = str(e)
-                    print(
-                        f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}"
-                    )
+                    print(f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}")
 
-                    if (
-                        "503" in err_msg
-                        or "UNAVAILABLE" in err_msg
-                        or "RESOURCE_EXHAUSTED" in err_msg
-                        or "429" in err_msg
-                    ):
+                    if any(code in err_msg for code in ["503", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "429"]):
                         if attempt < max_retries - 1:
-                            print(
-                                f"[Gemini] {model_name} sibuk, menunggu 1.5 detik..."
-                            )
+                            print(f"[Gemini] {model_name} sibuk, menunggu 1.5 detik...")
                             await asyncio.sleep(1.5)
                             continue
 
-    print(
-        "[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq..."
-    )
+    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
         return await call_groq_fallback(prompt)
     except Exception as fallback_err:
@@ -217,7 +181,7 @@ async def call_gemini_with_fallback(prompt: str) -> str:
 
 
 # ==========================================
-# PYDANTIC SCHEMAS UNTUK AI ARTICLE GENERATOR
+# PYDANTIC SCHEMAS
 # ==========================================
 class ArticleGenerateRequest(BaseModel):
     prompt: str
@@ -227,22 +191,14 @@ class ArticleGenerateRequest(BaseModel):
 
 
 class ArticleGenerateResponse(BaseModel):
-    title: str = Field(
-        description="Judul artikel menarik SEO maks 110 karakter"
-    )
+    title: str = Field(description="Judul artikel menarik SEO maks 110 karakter")
     slug: str = Field(description="Slug URL kebab-case")
     category: str = Field(description="Kategori berita")
-    excerpt: str = Field(
-        description="Meta description SEO maks 160 karakter"
-    )
-    content: str = Field(
-        description="Isi artikel multiparagraf dipisahkan dengan \\n\\n"
-    )
+    excerpt: str = Field(description="Meta description SEO maks 160 karakter")
+    content: str = Field(description="Isi artikel multiparagraf dipisahkan dengan \\n\\n")
     altText: str = Field(description="Alt text deskriptif untuk gambar cover")
     imageCredit: str = Field(description="Sumber/kredit foto")
-    tags: str = Field(
-        description="Tag dipisahkan koma, contoh: FC Barcelona, Hansi Flick, La Liga"
-    )
+    tags: str = Field(description="Tag dipisahkan koma, contoh: FC Barcelona, Hansi Flick, La Liga")
 
 
 class FieldRefineRequest(BaseModel):
@@ -257,7 +213,7 @@ class FieldRefineResponse(BaseModel):
 
 
 # ==========================================
-# HELPER FUNCTIONS & CACHE
+# HELPER FUNCTIONS & LOGO API
 # ==========================================
 def load_cache():
     if not redis_client:
@@ -284,25 +240,41 @@ def save_cache(data, expires_at: datetime):
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
+    """Mengambil logo tim dari Sports API / Wikimedia / Fallback."""
+    if not team_name:
+        return "https://crests.football-data.org/724.png"
+
+    # 1. Coba fetch dari TheSportsDB API
     try:
         encoded_name = urllib.parse.quote(team_name)
-        url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
-
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0"}
-        )
+        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={encoded_name}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
         with urllib.request.urlopen(req, timeout=3) as response:
             data = json.loads(response.read().decode())
             if data and data.get("teams") and len(data["teams"]) > 0:
                 badge_url = data["teams"][0].get("strBadge")
-                if badge_url:
+                if badge_url and badge_url.startswith("http"):
                     return badge_url
     except Exception as e:
-        print(f"[Logo Fetch Error] Gagal mengambil logo untuk {team_name}: {e}")
+        print(f"[Logo Fetch Warning] TheSportsDB lookup failed for {team_name}: {e}")
 
-    encoded_fallback = urllib.parse.quote(team_name[:3].upper())
-    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=262626&color=ffffff&bold=true"
+    # 2. Fallback Wikipedia API
+    try:
+        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages&titles={urllib.parse.quote(team_name)}&pithumbsize=500"
+        req = urllib.request.Request(wiki_url, headers={"User-Agent": "BarcainspoBot/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            wiki_data = json.loads(response.read().decode())
+            pages = wiki_data.get("query", {}).get("pages", {})
+            for page_id, page_info in pages.items():
+                if "thumbnail" in page_info:
+                    return page_info["thumbnail"]["source"]
+    except Exception as e:
+        print(f"[Logo Fetch Warning] Wikipedia lookup failed: {e}")
+
+    # 3. Last Fallback: UI Avatars Badge
+    encoded_fallback = urllib.parse.quote(team_name)
+    return f"https://ui-avatars.com/api/?name={encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
 # ==========================================
@@ -409,8 +381,9 @@ async def get_next_match():
             get_team_logo_dynamic, opponent_name
         )
 
+        # Gunakan SVG Resmi Wikimedia (Anti-Hotlink/CORS)
         parsed_data["barca_logo"] = (
-            "[https://images.fotmob.com/image_resources/logo/teamlogo/8634.png](https://images.fotmob.com/image_resources/logo/teamlogo/8634.png)"
+            "https://upload.wikimedia.org/wikipedia/en/4/47/FC_Barcelona_%28crest%29.svg"
         )
         parsed_data["opponent_logo"] = opponent_logo_url
 
