@@ -83,27 +83,29 @@ def get_next_match_data():
     }}
     """
     
-    # 1. Coba Gemini gemini-3.8-flash (Retry 3x jika 503 Overloaded)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            print(f"[Gemini] Memanggil gemini-3.8-flash (Percobaan {attempt + 1})...")
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            err_msg = str(e)
-            print(f"[Gemini Warning] gemini-3.8-flash percobaan {attempt + 1} gagal: {err_msg}")
-            if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
+    # Coba gemini-3.6-flash-lite terlebih dahulu, lalu gemini-3.6-flash
+    gemini_models = ["gemini-3.6-flash-lite", "gemini-3.6-flash"]
+    for model_name in gemini_models:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"[Gemini] Memanggil {model_name} (Percobaan {attempt + 1})...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"}
+                )
+                return json.loads(response.text)
+            except Exception as e:
+                err_msg = str(e)
+                print(f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}")
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
 
-    # 2. Fallback ke Groq jika Gemini gagal 3x
-    print("[Gemini Failed] Gemini sibuk/error. Dialihkan ke Groq...")
+    # Fallback ke Groq jika seluruh model Gemini gagal
+    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
         groq_response = call_groq_fallback(prompt)
         return json.loads(groq_response)

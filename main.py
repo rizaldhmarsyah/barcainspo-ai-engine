@@ -89,33 +89,36 @@ async def call_groq_fallback(prompt: str) -> str:
 
 async def call_gemini_with_fallback(prompt: str) -> str:
     """
-    1. Coba gemini-3.8-flash (Retry 3x jika hit 503 Overloaded)
-    2. Jika Gemini gagal/busy, pindah otomatis ke Groq Fallback
+    1. Coba gemini-3.6-flash-lite (Retry 3x jika hit 503/429)
+    2. Coba gemini-3.6-flash (Retry 3x)
+    3. Jika Gemini gagal/busy, pindah otomatis ke Groq Fallback
     """
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            print(f"[Gemini Request] Memanggil gemini-3.8-flash (Percobaan {attempt + 1})...")
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            return response.text
-        except Exception as e:
-            err_msg = str(e)
-            print(f"[Gemini Warning] gemini-3.8-flash percobaan {attempt + 1} gagal: {err_msg}")
-            
-            # Jika 503 Overloaded, tunggu 2 detik dan coba lagi
-            if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                if attempt < max_retries - 1:
-                    print("[Gemini] Server sibuk (503), menunggu 2 detik...")
-                    await asyncio.sleep(2)
-                    continue
+    gemini_models = ["gemini-3.6-flash-lite", "gemini-3.6-flash"]
 
-    # Jika Gemini gagal 3x, eksekusi Groq
-    print("[Gemini Failed] Gemini sibuk/error. Dialihkan ke Groq...")
+    for model_name in gemini_models:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"[Gemini Request] Memanggil {model_name} (Percobaan {attempt + 1})...")
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"}
+                )
+                return response.text
+            except Exception as e:
+                err_msg = str(e)
+                print(f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}")
+                
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+                    if attempt < max_retries - 1:
+                        print(f"[Gemini] {model_name} sibuk, menunggu 2 detik...")
+                        await asyncio.sleep(2)
+                        continue
+
+    # Jika seluruh model Gemini gagal, eksekusi Groq
+    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
         return await call_groq_fallback(prompt)
     except Exception as groq_err:
@@ -321,7 +324,6 @@ async def get_next_match():
 @app.post("/api/generate-article", response_model=ArticleGenerateResponse)
 async def generate_article(req: ArticleGenerateRequest):
     try:
-        # Prompt difokuskan sebagai Redaktur / Expander berbasis Fakta Legit (Ground Truth)
         prompt = f"""
         Kamu adalah Redaktur Berita Senior & Pengamat Taktis Sepak Bola untuk portal berita 'barcainspo®'.
         
