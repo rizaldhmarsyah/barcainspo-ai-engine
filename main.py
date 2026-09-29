@@ -79,7 +79,7 @@ async def call_mistral_fallback(prompt: str) -> str:
     if not MISTRAL_API_KEY or not mistral_client:
         raise Exception("MISTRAL_API_KEY belum terpasang atau client Mistral tidak aktif.")
 
-    mistral_models = ["open-mistral-7b", "mistral-small-latest"]
+    mistral_models = ["mistral-small-latest", "open-mistral-7b"]
 
     for model_name in mistral_models:
         try:
@@ -144,7 +144,7 @@ async def call_groq_fallback(prompt: str) -> str:
 async def call_gemini_with_fallback(prompt: str) -> str:
     """Tier 1 -> Tier 2 -> Tier 3 AI Failover Flow."""
     if client and GEMINI_API_KEY:
-        gemini_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+        gemini_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
         for model_name in gemini_models:
             max_retries = 2
@@ -219,7 +219,8 @@ def load_cache():
     if not redis_client:
         return None
     try:
-        data = redis_client.get("match_cache")
+        # Menggunakan key v2 untuk bypass data cache lama yang rusak
+        data = redis_client.get("match_cache_v2")
         if data:
             if isinstance(data, str):
                 return json.loads(data)
@@ -234,20 +235,20 @@ def save_cache(data, expires_at: datetime):
         return
     try:
         cache_payload = {"expires_at": expires_at.isoformat(), "data": data}
-        redis_client.set("match_cache", json.dumps(cache_payload))
+        redis_client.set("match_cache_v2", json.dumps(cache_payload))
     except Exception as e:
         print(f"[Redis Save Error] Gagal menyimpan cache: {e}")
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim dari Sports API / Wikimedia / Fallback."""
+    """Mengambil logo tim dari Sports API / Wikimedia / Fallback UI Avatars."""
     if not team_name:
-        return "https://crests.football-data.org/724.png"
+        return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
     # 1. Coba fetch dari TheSportsDB API
     try:
         encoded_name = urllib.parse.quote(team_name)
-        url = f"https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={encoded_name}"
+        url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
         with urllib.request.urlopen(req, timeout=3) as response:
@@ -259,22 +260,9 @@ def get_team_logo_dynamic(team_name: str) -> str:
     except Exception as e:
         print(f"[Logo Fetch Warning] TheSportsDB lookup failed for {team_name}: {e}")
 
-    # 2. Fallback Wikipedia API
-    try:
-        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&format=json&prop=pageimages&titles={urllib.parse.quote(team_name)}&pithumbsize=500"
-        req = urllib.request.Request(wiki_url, headers={"User-Agent": "BarcainspoBot/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as response:
-            wiki_data = json.loads(response.read().decode())
-            pages = wiki_data.get("query", {}).get("pages", {})
-            for page_id, page_info in pages.items():
-                if "thumbnail" in page_info:
-                    return page_info["thumbnail"]["source"]
-    except Exception as e:
-        print(f"[Logo Fetch Warning] Wikipedia lookup failed: {e}")
-
-    # 3. Last Fallback: UI Avatars Badge
+    # 2. Last Fallback: UI Avatars Badge
     encoded_fallback = urllib.parse.quote(team_name)
-    return f"https://ui-avatars.com/api/?name={encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
+    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
 # ==========================================
@@ -381,10 +369,8 @@ async def get_next_match():
             get_team_logo_dynamic, opponent_name
         )
 
-        # Gunakan SVG Resmi Wikimedia (Anti-Hotlink/CORS)
-        parsed_data["barca_logo"] = (
-            "https://upload.wikimedia.org/wikipedia/en/4/47/FC_Barcelona_%28crest%29.svg"
-        )
+        # Gunakan PNG resmi Football-Data CDN (Bebas CORS/Hotlink)
+        parsed_data["barca_logo"] = "[https://crests.football-data.org/81.png](https://crests.football-data.org/81.png)"
         parsed_data["opponent_logo"] = opponent_logo_url
 
         try:
