@@ -293,7 +293,25 @@ async def get_next_match():
     parsed_data["barca_logo"] = "[https://images.fotmob.com/image_resources/logo/teamlogo/8634.png](https://images.fotmob.com/image_resources/logo/teamlogo/8634.png)"
     parsed_data["opponent_logo"] = opponent_logo_url
 
-    expires_at = now + timedelta(hours=6)
+    # ==========================================
+    # PERBAIKAN LOGIKA EXPIRATION CACHE DINAMIS
+    # ==========================================
+    try:
+        match_iso_str = parsed_data.get("match_iso")
+        if match_iso_str:
+            kickoff_dt = datetime.fromisoformat(match_iso_str)
+            # Set cache kedaluwarsa 3 jam setelah kick-off pertandingan
+            expires_at = kickoff_dt + timedelta(hours=3)
+            
+            # Jika jam kick-off sudah lewat dari waktu server saat ini, set buffer refresh 1 jam
+            if now >= expires_at:
+                expires_at = now + timedelta(hours=1)
+        else:
+            expires_at = now + timedelta(hours=6)
+    except Exception as exp_err:
+        print(f"[Cache Expiry Warning] Gagal menghitung expiry dari match_iso: {exp_err}")
+        expires_at = now + timedelta(hours=6)
+
     save_cache(parsed_data, expires_at)
 
     return {
