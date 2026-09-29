@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-tavily = TavilyClient(api_key=TAVILY_API_KEY)
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
@@ -234,14 +234,16 @@ async def get_next_match():
         current_date_str = now.strftime("%d %B %Y")
         search_query = f"FC Barcelona next match schedule fixture date time kick off 2026 after {current_date_str}"
         
-        search_result = await asyncio.to_thread(
-            tavily.search,
-            query=search_query,
-            max_results=6
-        )
-        
-        results = search_result.get("results", [])
-        raw_text = "\n\n".join([f"Source ({item.get('url')}):\n{item.get('content')}" for item in results])
+        results = []
+        if tavily:
+            search_result = await asyncio.to_thread(
+                tavily.search,
+                query=search_query,
+                max_results=6
+            )
+            results = search_result.get("results", [])
+            
+        raw_text = "\n\n".join([f"Source ({item.get('url')}):\n{item.get('content')}" for item in results]) if results else "Data pencarian tidak tersedia."
         
         prompt = f"""
         Hari ini adalah tanggal {current_date_str}.
@@ -319,49 +321,36 @@ async def get_next_match():
 @app.post("/api/generate-article", response_model=ArticleGenerateResponse)
 async def generate_article(req: ArticleGenerateRequest):
     try:
-        search_query = f"FC Barcelona {req.topic or req.prompt} news 2026"
-        search_result = await asyncio.to_thread(
-            tavily.search,
-            query=search_query,
-            max_results=4
-        )
-        
-        results = search_result.get("results", [])
-        raw_context = "\n\n".join([f"Sumber ({item.get('url')}):\n{item.get('content')}" for item in results]) if results else "Tidak ada konteks berita tambahan."
-
+        # Prompt difokuskan sebagai Redaktur / Expander berbasis Fakta Legit (Ground Truth)
         prompt = f"""
         Kamu adalah Redaktur Berita Senior & Pengamat Taktis Sepak Bola untuk portal berita 'barcainspo®'.
         
-        EDITORIAL VOICE GUIDELINES:
-        - Bahasa: Bahasa Indonesia formal, bergaya majalah berita olahraga premium.
-        - Tone: Analitis, lugas, mengalir, kaya istilah taktis (contoh: *high pressing*, *possession*, *pivot*, *half-space*).
-        - Judul: Menarik, SEO-friendly (MAKSIMAL 110 KARAKTER), tanpa clickbait murahan.
-        - Excerpt: Wajib padat, informatif, MAKSIMAL 160 KARAKTER untuk Google Search Meta Description.
-        - Alt Text: Deskriptif untuk keterbacaan SEO Google Image.
+        TUGAS UTAMA:
+        Ubah TEKS UTAMA / FAKTA LEGIT dari user di bawah ini menjadi artikel berita jurnalistik yang utuh, profesional, dan kaya akan gaya penulisan taktis sepak bola.
 
-        INPUT USER:
-        - Instruction/Prompt: {req.prompt}
-        - Topik Khusus: {req.topic or 'FC Barcelona'}
-        - Kategori Target: {req.category or 'First Team'}
-        - Mode: {req.mode}
+        ATURAN EDITORIAL KETAT (GROUND TRUTH / BEBAS HALUSINASI):
+        1. FAKTA & DATA: DILARANG MEMBUAT ATAU MENGARANG fakta baru, skor, tanggal, nama pemain, atau angka transfer yang TIDAK ADA pada Teks Sumber. Semua informasi utama artikel wajib 100% bersumber dari Teks Sumber.
+        2. PENULISAN: Perluas kalimatnya, buat alur berita yang mengalir profesional, susun paragraf yang rapi, dan perjelas menggunakan istilah taktis sepak bola yang relevan (contoh: *high pressing*, *possession*, *pivot*, *half-space*).
+        3. JUDUL: Buat judul yang sangat menarik, SEO-friendly (MAKSIMAL 110 KARAKTER), mencerminkan fakta utama, dan tidak clickbait murahan.
+        4. EXCERPT: Buat meta description padat dan informatif (MAKSIMAL 160 KARAKTER).
+        5. ALT TEXT & TAGS: Ekstrak deskripsi gambar yang relevan dan tag SEO penting dari Teks Sumber.
 
-        BERITA & KONTEKS TERKINI (Tavily Search):
+        INPUT USER (TEKS UTAMA / FAKTA LEGIT):
         ---
-        {raw_context}
+        {req.prompt}
         ---
 
-        TUGAS:
-        Buat artikel berita/analisis utuh berdasarkan kriteria di atas.
+        KATEGORI TARGET: {req.category or 'First Team'}
 
         KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
         {{
-            "title": "Judul Artikel (maksimal 110 karakter)",
+            "title": "Judul Artikel SEO (maksimal 110 karakter)",
             "slug": "judul-artikel-dalam-kebab-case",
             "category": "{req.category or 'First Team'}",
             "excerpt": "Meta description singkat maksimal 160 karakter",
             "content": "Paragraf 1\\n\\nParagraf 2\\n\\nParagraf 3",
             "altText": "Deskripsi foto cover yang relevan dengan berita",
-            "imageCredit": "Getty Images / barcainspo®",
+            "imageCredit": "barcainspo® / Sumber Terkait",
             "tags": "FC Barcelona, Hansi Flick, La Liga"
         }}
         """
