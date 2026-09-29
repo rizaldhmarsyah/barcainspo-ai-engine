@@ -1,3 +1,4 @@
+#main.py
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
@@ -14,7 +15,6 @@ from pydantic import BaseModel, Field
 from tavily import TavilyClient
 from google import genai
 from groq import Groq
-from mistralai import Mistral
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis
@@ -26,7 +26,6 @@ app = FastAPI(title="Barcainspo AI Engine")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 REDIS_URL = os.getenv("KV_REST_API_URL")
 REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
@@ -43,25 +42,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+client = genai.Client(api_key=GEMINI_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-mistral_client = Mistral(api_key=MISTRAL_API_KEY) if MISTRAL_API_KEY else None
 
 
 # ==========================================
-# MULTI-PROVIDER AI EXECUTION (Groq -> Mistral -> Gemini)
+# HELPER CALL WITH MULTI-STAGE GROQ FALLBACK
 # ==========================================
-async def call_groq_primary(prompt: str) -> str:
-    """Primary AI Provider: Groq LPU dengan Llama 3."""
+async def call_groq_fallback(prompt: str) -> str:
+    """Fallback ke model Groq yang terkonfirmasi aktif di akun."""
     if not GROQ_API_KEY or not groq_client:
-        raise Exception("GROQ_API_KEY belum terpasang di file .env")
+        raise Exception("GROQ_API_KEY belum terpasang atau tidak valid di file .env")
 
-    groq_models = ["llama-3.3-70b-versatile", "llama3-70b-8192", "mixtral-8x7b-32768"]
+    groq_models = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b"
+    ]
 
     for model_name in groq_models:
         try:
-            print(f"[Groq Request] Memproses dengan model: {model_name}...")
+            print(f"[Groq Fallback] Memproses request dengan model: {model_name}...")
             completion = await asyncio.to_thread(
                 groq_client.chat.completions.create,
                 model=model_name,
@@ -70,7 +72,10 @@ async def call_groq_primary(prompt: str) -> str:
                         "role": "system",
                         "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta, tanpa markdown triple backticks (```json)."
                     },
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.3
@@ -82,40 +87,19 @@ async def call_groq_primary(prompt: str) -> str:
     raise Exception("Seluruh model Groq gagal merespons.")
 
 
-async def call_mistral_fallback(prompt: str) -> str:
-    """Fallback 1: Mistral AI Engine."""
-    if not MISTRAL_API_KEY or not mistral_client:
-        raise Exception("MISTRAL_API_KEY belum terpasang di file .env")
-
-    print("[Mistral Fallback] Memproses dengan mistral-small-latest...")
-    response = await asyncio.to_thread(
-        mistral_client.chat.complete,
-        model="mistral-small-latest",
-        messages=[
-            {
-                "role": "system",
-                "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta, tanpa markdown triple backticks."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3
-    )
-    return response.choices[0].message.content
-
-
-async def call_gemini_fallback(prompt: str) -> str:
-    """Fallback 2: Google Gemini API."""
-    if not client:
-        raise Exception("GEMINI_API_KEY belum terpasang di file .env")
-
+async def call_gemini_with_fallback(prompt: str) -> str:
+    """
+    1. Coba gemini-2.5-flash-lite (Retry 3x jika hit 503/429)
+    2. Coba gemini-2.5-flash (Retry 3x)
+    3. Jika Gemini gagal/busy, pindah otomatis ke Groq Fallback
+    """
     gemini_models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
     for model_name in gemini_models:
-        max_retries = 2
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                print(f"[Gemini Fallback] Memanggil {model_name} (Percobaan {attempt + 1})...")
+                print(f"[Gemini Request] Memanggil {model_name} (Percobaan {attempt + 1})...")
                 response = await asyncio.to_thread(
                     client.models.generate_content,
                     model=model_name,
@@ -126,33 +110,21 @@ async def call_gemini_fallback(prompt: str) -> str:
             except Exception as e:
                 err_msg = str(e)
                 print(f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}")
+                
                 if "503" in err_msg or "UNAVAILABLE" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1.5)
+                        print(f"[Gemini] {model_name} sibuk, menunggu 2 detik...")
+                        await asyncio.sleep(2)
                         continue
 
-    raise Exception("Seluruh model Gemini gagal merespons.")
-
-
-async def call_ai_pipeline(prompt: str) -> str:
-    """Orkestrator Pipeline AI: Groq -> Mistral -> Gemini."""
+    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
-        return await call_groq_primary(prompt)
+        return await call_groq_fallback(prompt)
     except Exception as groq_err:
-        print(f"[Groq Failed]: {groq_err}. Mengalihkan ke Mistral AI...")
-
-    try:
-        return await call_mistral_fallback(prompt)
-    except Exception as mistral_err:
-        print(f"[Mistral Failed]: {mistral_err}. Mengalihkan ke Gemini...")
-
-    try:
-        return await call_gemini_fallback(prompt)
-    except Exception as gemini_err:
-        print(f"[Gemini Failed]: {gemini_err}")
+        print(f"[Groq Error] Gagal memproses via Groq: {groq_err}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Semua Provider AI (Groq, Mistral, Gemini) gagal merespons: {str(gemini_err)}"
+            status_code=500, 
+            detail=f"Semua Provider AI (Gemini & Groq) gagal merespons: {str(groq_err)}"
         )
 
 
@@ -307,7 +279,7 @@ async def get_next_match():
         }}
         """
         
-        raw_response = await call_ai_pipeline(prompt)
+        raw_response = await call_gemini_with_fallback(prompt)
         parsed_data = json.loads(raw_response)
         opponent_name = parsed_data.get("opponent", "")
 
@@ -384,7 +356,7 @@ async def generate_article(req: ArticleGenerateRequest):
         }}
         """
 
-        raw_response = await call_ai_pipeline(prompt)
+        raw_response = await call_gemini_with_fallback(prompt)
         parsed_json = json.loads(raw_response)
         return parsed_json
 
@@ -425,7 +397,7 @@ async def refine_field(req: FieldRefineRequest):
         }}
         """
 
-        raw_response = await call_ai_pipeline(prompt)
+        raw_response = await call_gemini_with_fallback(prompt)
         parsed_json = json.loads(raw_response)
         return parsed_json
 
