@@ -1,3 +1,4 @@
+#main.py
 import os
 import re
 import json
@@ -482,3 +483,143 @@ async def refine_field(req: FieldRefineRequest):
         raise HTTPException(
             status_code=500, detail=f"Gagal merevisi komponen: {str(e)}"
         )
+
+
+
+# ==========================================
+# PYDANTIC SCHEMAS TAMBAHAN FOR X-NEWS AGENT
+# ==========================================
+class XNewsFetchRequest(BaseModel):
+    handles: Optional[list[str]] = ["FabrizioRomano", "gerardromero", "ToniJuanmarti", "ReshadFCB"]
+    max_results: Optional[int] = 5
+
+class XNewsLeadItem(BaseModel):
+    sourceHandle: str
+    headline: str
+    summary: str
+    rawContent: str
+    tweetUrl: Optional[str] = None
+    createdAt: str
+
+class XNewsFetchResponse(BaseModel):
+    success: bool
+    count: int
+    leads: list[XNewsLeadItem]
+
+# ==========================================
+# ENDPOINTS TAMBAHAN FOR X-NEWS AGENT
+# ==========================================
+@app.post("/api/x-news/fetch", response_model=XNewsFetchResponse)
+async def fetch_x_news_leads(req: XNewsFetchRequest):
+    """
+    Agent pemantau X: Mengambil update berita/isu terkini dari jurnalis/sumber Barça pilihan via Tavily
+    (terbatas maksimal 5-7 hari terakhir), kemudian menyaring secara ketat HANYA postingan berharga berita.
+    """
+    try:
+        today_dt = datetime.now()
+        today_iso = today_dt.strftime("%Y-%m-%d")
+        current_date_str = today_dt.strftime("%d %B %Y")
+        
+        # 1. LAPIS PERTAMA: Query Tavily + Negative Keywords
+        clean_handles = [h.strip("@") for h in (req.handles or [])]
+        handles_query = " OR ".join([f'site:x.com/{h}' for h in clean_handles])
+        
+        search_query = (
+            f'({handles_query}) ("Barcelona" OR "Barça") '
+            f'-"GOAL" -"FULL TIME" -"HALF TIME" -"HAPPY BIRTHDAY" -"MATCHDAY" -"VAMOS"'
+        )
+        
+        results = []
+        if tavily:
+            # Menggunakan time_range="w" (7 hari terakhir) di Tavily API
+            search_result = await asyncio.to_thread(
+                tavily.search, 
+                query=search_query, 
+                max_results=req.max_results,
+                search_depth="advanced",
+                time_range="w"  # Restriksi pencarian HANYA 1 minggu (7 hari) terakhir
+            )
+            results = search_result.get("results", [])
+
+        if not results:
+            return {"success": True, "count": 0, "leads": []}
+
+        raw_text = "\n\n".join([
+            f"Source URL ({item.get('url')}):\n{item.get('content')}"
+            for item in results
+        ])
+
+        # 2. LAPIS KEDUA: System Prompt Penyaringan Kategori & Rentang Waktu
+        prompt = f"""
+        Hari ini adalah tanggal {current_date_str} (ISO: {today_iso}).
+        Kamu adalah Head Editor Berita Utama untuk portal berita olahraga 'barcainspo®'.
+
+        TUGAS UTAMA:
+        Analisis teks mentah hasil pemantauan dari X (Twitter) berikut ini.
+        Saring HANYA cuitan yang MEMILIKI VALUE BERITA UTAMA dan SANGAT LAYAK DIBAWA KE DRAFT ARTIKEL.
+
+        KRITERIA KETAT PENYARINGAN:
+
+        1. RENTANG WAKTU (MAXIMAL 5-7 HARI TERAKHIR):
+           - HANYA ambil postingan/berita/isu yang terjadi atau dipublikasikan dalam RENTANG WAKTU 5 HINGGA 7 HARI TERAKHIR dari hari ini ({current_date_str}).
+           - ABAIKAN dan BUANG semua isu/berita lama yang sudah berumur lebih dari 7 hari atau isu yang sudah basi/berlalu.
+
+        2. WAJIB LOLOS (BERITA BERHARGA & TERBARU):
+           - Rumor atau Kepastian Transfer (tawaran resmi, pembicaraan agen, minat klub, klausul rilis, negosiasi gaji).
+           - Perpanjangan & Pembaruan Kontrak pemain/pelatih.
+           - Berita Medis & Cedera (lama absen, kondisi operasi, jadwal kembalinya pemain).
+           - Pernyataan Resmi & Konferensi Pers (kata-kata Hansi Flick, Laporta, Deco, atau pemain).
+           - Isu Manajemen, Keuangan & FFP (Aturan 1:1 La Liga, pendaftaran pemain, sponsor utama, renovasi Camp Nou).
+           - Analisis taktik mendalam atau statistik rekor bermakna yang mengubah peta persaingan.
+
+        3. WAJIB DIBUANG / HARAM HUKUMNYA (TIDAK LOLOS):
+           - Isu/berita lama melebihi rentang 7 hari terakhir.
+           - Live Score / Update Skor Pertandingan (Contoh: "GOAL! Lewandowski 1-0", "Halftime: 0-0", "Starting XI Barca").
+           - Ucapan Ulang Tahun / Peringatan / Seremonial (Contoh: "Happy Birthday Gavi!", "Rest in peace...").
+           - Slogan Emosional / Text Pendek Tanpa Fakta Berita (Contoh: "Visca el Barça!", "Matchday!", "Vamos! 🔥").
+           - Promosi Toko, Merchandise, Tiket, Polling Fans, atau Giveaway.
+           - Opini Murni / Spekulasi Unverified dari Fans tanpa fakta jurnalis.
+
+        DATA MENTAH DARI X:
+        ---
+        {raw_text}
+        ---
+
+        INSTRUKSI OUTPUT:
+        - Jika ada berita yang lolos kriteria waktu dan konten, susun menjadi ringkasan yang kaya informasi dan padat.
+        - Jika TIDAK ADA berita yang memenuhi kriteria, kembalikan array kosong: {{"leads": []}}.
+        - Kembalikan HANYA JSON MURNI tanpa format markdown triple backticks (```json) atau teks pengantar lainnya.
+
+        STRUKTUR JSON MUSTI PERSIS SEPERTI INI:
+        {{
+            "leads": [
+                {{
+                    "sourceHandle": "@NamaHandle (misal: @FabrizioRomano)",
+                    "headline": "Judul berita yang padat, menarik, dan informatif dalam Bahasa Indonesia (1 kalimat)",
+                    "summary": "Ringkasan poin-poin fakta utama berita dalam Bahasa Indonesia (2-3 kalimat penjelasan mendalam)",
+                    "rawContent": "Kutipan teks asli dari cuitan tersebut",
+                    "tweetUrl": "URL sumber asli jika ada dari data di atas, atau kosongi jika tidak ada",
+                    "createdAt": "{today_iso}"
+                }}
+            ]
+        }}
+        """
+
+        raw_response = await call_gemini_with_fallback(prompt)
+        cleaned_response = clean_json_string(raw_response)
+        parsed_data = json.loads(cleaned_response)
+
+        leads_data = parsed_data.get("leads", [])
+        
+        if not isinstance(leads_data, list):
+            leads_data = []
+
+        return {
+            "success": True,
+            "count": len(leads_data),
+            "leads": leads_data
+        }
+
+    except Exception as e:
+        print(f"[X-News Agent Error]: {e}")
+        raise HTTPException(status_code=500, detail=f"Gagal memproses X Agent: {str(e)}")
