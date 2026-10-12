@@ -31,6 +31,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 
 REDIS_URL = os.getenv("KV_REST_API_URL")
 REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
@@ -251,12 +252,39 @@ def save_cache(data, expires_at: datetime):
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim dari Sports API / Wikimedia / Fallback UI Avatars."""
+    """Mengambil logo tim resmi via API-Football CDN dengan fallback cepat."""
     if not team_name:
         return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
+    clean_name = team_name.strip()
+
+    # 1. PERIKSA VIA API-FOOTBALL (Official HD Logos)
+    if API_FOOTBALL_KEY:
+        try:
+            encoded_name = urllib.parse.quote(clean_name)
+            url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "x-apisports-key": API_FOOTBALL_KEY,
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode())
+                if data and data.get("response") and len(data["response"]) > 0:
+                    team_info = data["response"][0].get("team", {})
+                    logo_url = team_info.get("logo")
+                    if logo_url and logo_url.startswith("http"):
+                        print(f"[Logo Success] Logo ditemukan via API-Football untuk: {clean_name}")
+                        return logo_url
+        except Exception as e:
+            print(f"[API-Football Warning] Gagal mengambil logo {clean_name}: {e}")
+
+    # 2. FALLBACK KE THESPORTSDB JIKA API-FOOTBALL TIMEOUT/KOSONG
     try:
-        encoded_name = urllib.parse.quote(team_name)
+        encoded_name = urllib.parse.quote(clean_name)
         url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
@@ -267,9 +295,10 @@ def get_team_logo_dynamic(team_name: str) -> str:
                 if badge_url and badge_url.startswith("http"):
                     return badge_url
     except Exception as e:
-        print(f"[Logo Fetch Warning] TheSportsDB lookup failed for {team_name}: {e}")
+        print(f"[TheSportsDB Warning] Gagal mengambil logo {clean_name}: {e}")
 
-    encoded_fallback = urllib.parse.quote(team_name)
+    # 3. FALLBACK TERAKHIR (UI Avatars)
+    encoded_fallback = urllib.parse.quote(clean_name)
     return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
@@ -387,7 +416,7 @@ async def get_next_match():
             parsed_data["venue"] = "Away"
             opponent_name = "Galatasaray"
 
-        # Fetch Logo Dinamis
+        # Fetch Logo Dinamis via API-Football
         opponent_logo_url = await asyncio.to_thread(
             get_team_logo_dynamic, opponent_name
         )
