@@ -350,13 +350,14 @@ async def get_next_match():
         ---
 
         ATURAN PENULISAN & KONVERSI WAKTU:
-        1. "opponent": Nama resmi klub lawan (Contoh: "Galatasaray", "Real Betis", "Real Madrid"). DILARANG memuat kata tambahan seperti "Data tidak ditemukan".
+        1. "opponent": Nama resmi klub lawan (Contoh: "Galatasaray", "Real Betis").
         2. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
         3. "venue": Tulis "Home" atau "Away".
         4. KONVERSI JAM KE WIB (UTC+7):
-           - Jika waktu di Europe/Spain (CEST / UTC+2), TAMBAHKAN 5 JAM ke WIB.
-           - Pastikan jam kick-off diisi secara akurat (contoh: "02:00 WIB" atau "23:30 WIB").
-        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "14 Oktober 2026" atau "17 Oktober 2026").
+           - Laga malam UEFA Champions League / La Liga biasanya dimulai jam 21:00 CEST (Waktu Spanyol).
+           - 21:00 CEST setara tepat dengan jam 02:00 WIB (Bukan 03:00 WIB).
+           - Pastikan jam kick-off diisi persis sesuai zona WIB resmi (contoh: "02:00 WIB" atau "23:30 WIB").
+        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "14 Oktober 2026").
         6. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-14T02:00:00").
 
         KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
