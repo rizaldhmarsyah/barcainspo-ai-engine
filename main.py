@@ -653,78 +653,91 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
         }
 
 # ==========================================
-# ENDPOINT KLASEMEN LA LIGA (API-FOOTBALL + REDIS CACHE 24H)
+# ENDPOINT KLASEMEN LA LIGA (AUTO FALLBACK & ANTI-EMPTY CACHE)
 # ==========================================
 @app.get("/api/standings")
 async def get_la_liga_standings():
     try:
         now = datetime.now()
 
-        # 1. CEK CACHE REDIS (24 JAM TTL)
+        # 1. CEK CACHE REDIS (Hanya gunakan jika data TIDAK KOSONG)
         if redis_client:
             try:
                 cached = redis_client.get("standings_cache_v1")
                 if cached:
                     cached_data = json.loads(cached) if isinstance(cached, str) else cached
                     expires_at = datetime.fromisoformat(cached_data.get("expires_at"))
-                    if now < expires_at:
+                    cached_list = cached_data.get("data", [])
+                    
+                    # Syarat: Waktu belum expired DAN data tidak kosong!
+                    if now < expires_at and len(cached_list) > 0:
                         return {
                             "success": True,
                             "cached": True,
-                            "data": cached_data.get("data", []),
+                            "data": cached_list,
                         }
             except Exception as e:
                 print(f"[Standings Cache Load Error]: {e}")
 
-        # 2. FETCH KE API-FOOTBALL (League ID La Liga = 140)
+        # 2. FETCH KE API-FOOTBALL
         if not API_FOOTBALL_KEY:
             raise HTTPException(
-                status_code=500, detail="API_FOOTBALL_KEY belum terpasang di .env"
+                status_code=500, detail="API_FOOTBALL_KEY belum terpasang di environment variable"
             )
 
-        # ID 140 = La Liga, Season = 2026
-        url = "https://v3.football.api-sports.io/standings?league=140&season=2026"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "x-apisports-key": API_FOOTBALL_KEY,
-                "User-Agent": "Mozilla/5.0",
-            },
-        )
-
-        with urllib.request.urlopen(req, timeout=6) as response:
-            res_data = json.loads(response.read().decode())
-
+        # Coba season 2026 terlebih dahulu, lalu fallback ke 2025 jika belum ada
+        seasons_to_try = [2026, 2025]
         standings_list = []
-        if res_data and res_data.get("response") and len(res_data["response"]) > 0:
-            league_info = res_data["response"][0].get("league", {})
-            raw_standings = league_info.get("standings", [[]])[0]
 
-            for item in raw_standings:
-                standings_list.append({
-                    "rank": item.get("rank"),
-                    "team_name": item.get("team", {}).get("name"),
-                    "team_logo": item.get("team", {}).get("logo"),
-                    "played": item.get("all", {}).get("played"),
-                    "win": item.get("all", {}).get("win"),
-                    "draw": item.get("all", {}).get("draw"),
-                    "lose": item.get("all", {}).get("lose"),
-                    "goals_diff": item.get("goalsDiff"),
-                    "points": item.get("points"),
-                })
+        for season in seasons_to_try:
+            url = f"https://v3.football.api-sports.io/standings?league=140&season={season}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "x-apisports-key": API_FOOTBALL_KEY,
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
 
-        # 3. SIMPAN KE REDIS DENGAN EXPIRE 24 JAM
-        expires_at = now + timedelta(hours=24)
-        cache_payload = {
-            "expires_at": expires_at.isoformat(),
-            "data": standings_list,
-        }
-
-        if redis_client:
             try:
-                redis_client.set("standings_cache_v1", json.dumps(cache_payload))
-            except Exception as e:
-                print(f"[Standings Cache Save Error]: {e}")
+                with urllib.request.urlopen(req, timeout=6) as response:
+                    res_data = json.loads(response.read().decode())
+
+                if res_data and res_data.get("response") and len(res_data["response"]) > 0:
+                    league_info = res_data["response"][0].get("league", {})
+                    raw_standings = league_info.get("standings", [[]])[0]
+
+                    for item in raw_standings:
+                        standings_list.append({
+                            "rank": item.get("rank"),
+                            "team_name": item.get("team", {}).get("name"),
+                            "team_logo": item.get("team", {}).get("logo"),
+                            "played": item.get("all", {}).get("played"),
+                            "win": item.get("all", {}).get("win"),
+                            "draw": item.get("all", {}).get("draw"),
+                            "lose": item.get("all", {}).get("lose"),
+                            "goals_diff": item.get("goalsDiff"),
+                            "points": item.get("points"),
+                        })
+
+                    if standings_list:
+                        break  # Data berhasil didapatkan
+            except Exception as fetch_err:
+                print(f"[Standings Fetch Warning season {season}]: {fetch_err}")
+
+        # 3. SIMPAN KE REDIS (Hanya jika data berhasil didapatkan / TIDAK KOSONG)
+        if standings_list:
+            expires_at = now + timedelta(hours=24)
+            cache_payload = {
+                "expires_at": expires_at.isoformat(),
+                "data": standings_list,
+            }
+
+            if redis_client:
+                try:
+                    redis_client.set("standings_cache_v1", json.dumps(cache_payload))
+                except Exception as e:
+                    print(f"[Standings Cache Save Error]: {e}")
 
         return {"success": True, "cached": False, "data": standings_list}
 
