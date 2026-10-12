@@ -1,4 +1,3 @@
-#main.py
 import os
 import re
 import json
@@ -6,7 +5,7 @@ import asyncio
 import warnings
 import urllib.parse
 import urllib.request
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -148,27 +147,18 @@ async def call_gemini_with_fallback(prompt: str) -> str:
         gemini_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
         for model_name in gemini_models:
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    print(f"[Gemini Request] Memanggil {model_name} (Percobaan {attempt + 1})...")
-                    response = await asyncio.to_thread(
-                        client.models.generate_content,
-                        model=model_name,
-                        contents=prompt,
-                        config={"response_mime_type": "application/json"},
-                    )
-                    if response and response.text:
-                        return response.text
-                except Exception as e:
-                    err_msg = str(e)
-                    print(f"[Gemini Warning] {model_name} percobaan {attempt + 1} gagal: {err_msg}")
-
-                    if any(code in err_msg for code in ["503", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "429"]):
-                        if attempt < max_retries - 1:
-                            print(f"[Gemini] {model_name} sibuk, menunggu 1.5 detik...")
-                            await asyncio.sleep(1.5)
-                            continue
+            try:
+                print(f"[Gemini Request] Memanggil {model_name}...")
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=model_name,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                print(f"[Gemini Warning] {model_name} gagal: {e}")
 
     print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
@@ -213,6 +203,26 @@ class FieldRefineResponse(BaseModel):
     options: list[str] = Field(description="Daftar 3 variasi/revisi teks")
 
 
+class XNewsFetchRequest(BaseModel):
+    handles: Optional[List[str]] = ["FabrizioRomano", "gerardromero", "ToniJuanmarti", "ReshadFCB"]
+    max_results: Optional[int] = 5
+
+
+class XNewsLeadItem(BaseModel):
+    sourceHandle: str
+    headline: str
+    summary: str
+    rawContent: str
+    tweetUrl: Optional[str] = None
+    createdAt: str
+
+
+class XNewsFetchResponse(BaseModel):
+    success: bool
+    count: int
+    leads: List[XNewsLeadItem]
+
+
 # ==========================================
 # HELPER FUNCTIONS & LOGO API
 # ==========================================
@@ -220,7 +230,6 @@ def load_cache():
     if not redis_client:
         return None
     try:
-        # Menggunakan key v2 untuk bypass data cache lama yang rusak
         data = redis_client.get("match_cache_v2")
         if data:
             if isinstance(data, str):
@@ -246,7 +255,6 @@ def get_team_logo_dynamic(team_name: str) -> str:
     if not team_name:
         return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
-    # 1. Coba fetch dari TheSportsDB API
     try:
         encoded_name = urllib.parse.quote(team_name)
         url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
@@ -261,7 +269,6 @@ def get_team_logo_dynamic(team_name: str) -> str:
     except Exception as e:
         print(f"[Logo Fetch Warning] TheSportsDB lookup failed for {team_name}: {e}")
 
-    # 2. Last Fallback: UI Avatars Badge
     encoded_fallback = urllib.parse.quote(team_name)
     return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
@@ -283,6 +290,7 @@ async def get_next_match():
         now = datetime.now()
         cache = load_cache()
 
+        # 1. CEK CACHE REDIS
         if cache and "expires_at" in cache:
             try:
                 expires_at = datetime.fromisoformat(cache["expires_at"])
@@ -296,14 +304,22 @@ async def get_next_match():
                 print(f"[Cache Read Error] Parsing ISO Format gagal: {e}")
 
         current_date_str = now.strftime("%d %B %Y")
-        search_query = f"FC Barcelona next match schedule fixture date time kick off 2026 after {current_date_str}"
+        
+        # 2. QUERY TAVILY SEARCH (Pencarian Seluruh Kompetisi)
+        search_query = (
+            f"FC Barcelona upcoming fixture schedule Champions League La Liga "
+            f"date kick off time 2026 after {current_date_str}"
+        )
 
         results = []
         if tavily:
-            search_result = await asyncio.to_thread(
-                tavily.search, query=search_query, max_results=6
-            )
-            results = search_result.get("results", [])
+            try:
+                search_result = await asyncio.to_thread(
+                    tavily.search, query=search_query, max_results=8, search_depth="advanced"
+                )
+                results = search_result.get("results", [])
+            except Exception as t_err:
+                print(f"[Tavily Search Warning]: {t_err}")
 
         raw_text = (
             "\n\n".join(
@@ -313,67 +329,72 @@ async def get_next_match():
                 ]
             )
             if results
-            else "Data pencarian tidak tersedia."
+            else "Data pencarian web tidak tersedia."
         )
 
+        # 3. PROMPT LLM GEMINI
         prompt = f"""
         Hari ini adalah tanggal {current_date_str}.
 
-        Tugas utama kamu adalah mengekstrak jadwal pertandingan resmi FC Barcelona (tim pria utama) TERDEKAT berikutnya yang BELUM dimainkan (setelah {current_date_str}).
+        TUGAS UTAMA:
+        Cari dan ekstrak 1 PERTANDINGAN TERDEKAT BARCELONA (tim utama pria) yang BELUM dimainkan setelah tanggal {current_date_str}.
 
-        Berikut adalah data mentah hasil pencarian web:
+        PERIKSA SELURUH KOMPETISI:
+        - UEFA Champions League (UCL)
+        - La Liga
+        - Copa del Rey / Supercopa
+
+        DATA MENTAH PENCARIAN WEB:
         ---
         {raw_text}
         ---
 
         ATURAN PENULISAN & KONVERSI WAKTU:
-        1. Ekstrak nama lawan, kompetisi, venue (Home/Away), tanggal, dan jam kick-off.
-        2. Nama lawan HANYA boleh berisi nama klub (contoh: "Getafe CF", "Sevilla FC", "Real Madrid"). DILARANG memuat kalimat penjelasan seperti "Data tidak ditemukan".
-        3. Konversikan waktu ke Waktu Indonesia Barat (WIB / UTC+7):
-           - Jika waktu di artikel adalah Spanyol (CEST / UTC+2), tambahkan 5 Jam.
-           - Contoh: 18:30 CEST = 23:30 WIB.
-           - Contoh: 21:00 CEST = 02:00 WIB (hari berikutnya).
-        4. Tulis tanggal dalam Bahasa Indonesia setelah konversi WIB (contoh: "10 Oktober 2026").
-        5. "time" diisi jam WIB (contoh: "23:30 WIB" atau "02:00 WIB").
-        6. "match_iso" diisi ISO 8601 standar waktu WIB (contoh: "2026-10-10T23:30:00").
+        1. "opponent": Nama resmi klub lawan (Contoh: "Galatasaray", "Real Betis", "Real Madrid"). DILARANG memuat kata tambahan seperti "Data tidak ditemukan".
+        2. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
+        3. "venue": Tulis "Home" atau "Away".
+        4. KONVERSI JAM KE WIB (UTC+7):
+           - Jika waktu di Europe/Spain (CEST / UTC+2), TAMBAHKAN 5 JAM ke WIB.
+           - Pastikan jam kick-off diisi secara akurat (contoh: "02:00 WIB" atau "23:30 WIB").
+        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "14 Oktober 2026" atau "17 Oktober 2026").
+        6. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-14T02:00:00").
 
-        Kembalikan HANYA JSON murni dengan format:
+        KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
         {{
-            "opponent": "Nama Klub Lawan",
-            "date": "Tanggal WIB (contoh: 10 Oktober 2026)",
-            "time": "Jam WIB (contoh: 23:30 WIB)",
-            "match_iso": "YYYY-MM-DDTHH:MM:SS",
-            "competition": "Nama Kompetisi (contoh: La Liga)",
-            "venue": "Home atau Away"
+            "opponent": "Galatasaray",
+            "date": "14 Oktober 2026",
+            "time": "02:00 WIB",
+            "match_iso": "2026-10-14T02:00:00",
+            "competition": "UEFA Champions League",
+            "venue": "Away"
         }}
         """
 
         raw_response = await call_gemini_with_fallback(prompt)
         cleaned_response = clean_json_string(raw_response)
         parsed_data = json.loads(cleaned_response)
+
         opponent_name = parsed_data.get("opponent", "")
 
-        if (
-            not opponent_name
-            or "tidak ditemukan" in opponent_name.lower()
-            or len(opponent_name) > 30
-        ):
-            parsed_data["opponent"] = "Getafe CF"
-            parsed_data["date"] = "10 Oktober 2026"
-            parsed_data["time"] = "23:30 WIB"
-            parsed_data["match_iso"] = "2026-10-10T23:30:00"
-            parsed_data["competition"] = "La Liga"
-            parsed_data["venue"] = "Home"
-            opponent_name = "Getafe CF"
+        # Fallback jika parsing LLM gagal/kosong
+        if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 35:
+            parsed_data["opponent"] = "Galatasaray"
+            parsed_data["date"] = "14 Oktober 2026"
+            parsed_data["time"] = "02:00 WIB"
+            parsed_data["match_iso"] = "2026-10-14T02:00:00"
+            parsed_data["competition"] = "UEFA Champions League"
+            parsed_data["venue"] = "Away"
+            opponent_name = "Galatasaray"
 
+        # Fetch Logo Dinamis
         opponent_logo_url = await asyncio.to_thread(
             get_team_logo_dynamic, opponent_name
         )
 
-        # Gunakan PNG resmi Football-Data CDN (Bebas CORS/Hotlink)
         parsed_data["barca_logo"] = "[https://crests.football-data.org/81.png](https://crests.football-data.org/81.png)"
         parsed_data["opponent_logo"] = opponent_logo_url
 
+        # 4. LOGIKA SMART CACHE (DYNAMICAL & TOKEN SAVER)
         try:
             match_iso_str = parsed_data.get("match_iso")
             if match_iso_str:
@@ -381,15 +402,32 @@ async def get_next_match():
             else:
                 kickoff_dt = now + timedelta(hours=24)
 
-            expires_at = kickoff_dt + timedelta(hours=3)
-        except Exception:
-            expires_at = now + timedelta(hours=12)
+            match_end_dt = kickoff_dt + timedelta(hours=3)
+            hours_until_kickoff = (kickoff_dt - now).total_seconds() / 3600
 
+            if now >= match_end_dt:
+                # 1. Pertandingan sudah selesai (>3 jam setelah kick-off): langsung expire sekarang
+                expires_at = now
+            elif now >= kickoff_dt - timedelta(hours=3) and now < match_end_dt:
+                # 2. Sedang bertanding: expire tepat setelah pertandingan usai
+                expires_at = match_end_dt
+            elif hours_until_kickoff <= 24:
+                # 3. Mendekati pertandingan (<24 jam): update tiap 6 jam
+                expires_at = now + timedelta(hours=6)
+            else:
+                # 4. Pertandingan masih lama (>24 jam): HEMAT TOKEN! Simpan cache selama 24 JAM (1 Hari)
+                expires_at = now + timedelta(hours=24)
+
+        except Exception:
+            expires_at = now + timedelta(hours=24)
+
+        # Simpan ke Redis
         save_cache(parsed_data, expires_at)
 
         return {"success": True, "cached": False, "data": parsed_data}
 
     except Exception as e:
+        print(f"[Next Match API Error]: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -403,11 +441,10 @@ async def generate_article(req: ArticleGenerateRequest):
         Ubah TEKS UTAMA / FAKTA LEGIT dari user di bawah ini menjadi artikel berita jurnalistik yang utuh, profesional, dan kaya akan gaya penulisan taktis sepak bola.
 
         ATURAN EDITORIAL KETAT (GROUND TRUTH / BEBAS HALUSINASI):
-        1. FAKTA & DATA: DILARANG MEMBUAT ATAU MENGARANG fakta baru, skor, tanggal, nama pemain, atau angka transfer yang TIDAK ADA pada Teks Sumber. Semua informasi utama artikel wajib 100% bersumber dari Teks Sumber.
-        2. PENULISAN: Perluas kalimatnya, buat alur berita yang mengalir profesional, susun paragraf yang rapi, dan perjelas menggunakan istilah taktis sepak bola yang relevan (contoh: *high pressing*, *possession*, *pivot*, *half-space*).
-        3. JUDUL: Buat judul yang sangat menarik, SEO-friendly (MAKSIMAL 110 KARAKTER), mencerminkan fakta utama, dan tidak clickbait murahan.
+        1. FAKTA & DATA: DILARANG MEMBUAT ATAU MENGARANG fakta baru, skor, tanggal, nama pemain, atau angka transfer yang TIDAK ADA pada Teks Sumber.
+        2. PENULISAN: Perluas kalimatnya, buat alur berita yang mengalir profesional, susun paragraf yang rapi, dan perjelas menggunakan istilah taktis sepak bola.
+        3. JUDUL: Buat judul yang sangat menarik, SEO-friendly (MAKSIMAL 110 KARAKTER).
         4. EXCERPT: Buat meta description padat dan informatif (MAKSIMAL 160 KARAKTER).
-        5. ALT TEXT & TAGS: Ekstrak deskripsi gambar yang relevan dan tag SEO penting dari Teks Sumber.
 
         INPUT USER (TEKS UTAMA / FAKTA LEGIT):
         ---
@@ -456,13 +493,6 @@ async def refine_field(req: FieldRefineRequest):
         INSTRUKSI REVISI / ARAHAN USER:
         "{req.instruction}"
 
-        ATURAN KOMPONEN:
-        - Jika field 'title': Maksimal 110 karakter, menarik, SEO friendly.
-        - Jika field 'excerpt': Maksimal 160 karakter untuk Meta Description.
-        - Jika field 'content': Multiparagraf dipisahkan '\\n\\n', analitis taktis.
-        - Jika field 'altText': Deskriptif SEO gambar.
-        - Jika field 'tags': Pisahkan dengan koma.
-
         KEMBALIKAN HANYA JSON MURNI DENGAN FORMAT:
         {{
             "options": [
@@ -485,61 +515,39 @@ async def refine_field(req: FieldRefineRequest):
         )
 
 
-
-# ==========================================
-# PYDANTIC SCHEMAS TAMBAHAN FOR X-NEWS AGENT
-# ==========================================
-class XNewsFetchRequest(BaseModel):
-    handles: Optional[list[str]] = ["FabrizioRomano", "gerardromero", "ToniJuanmarti", "ReshadFCB"]
-    max_results: Optional[int] = 5
-
-class XNewsLeadItem(BaseModel):
-    sourceHandle: str
-    headline: str
-    summary: str
-    rawContent: str
-    tweetUrl: Optional[str] = None
-    createdAt: str
-
-class XNewsFetchResponse(BaseModel):
-    success: bool
-    count: int
-    leads: list[XNewsLeadItem]
-
-# ==========================================
-# ENDPOINTS TAMBAHAN FOR X-NEWS AGENT
-# ==========================================
 @app.post("/api/x-news/fetch", response_model=XNewsFetchResponse)
 async def fetch_x_news_leads(req: XNewsFetchRequest):
-    """
-    Agent pemantau X: Mengambil update berita/isu terkini dari jurnalis/sumber Barça pilihan via Tavily
-    (terbatas maksimal 5-7 hari terakhir), kemudian menyaring secara ketat HANYA postingan berharga berita.
-    """
     try:
         today_dt = datetime.now()
         today_iso = today_dt.strftime("%Y-%m-%d")
         current_date_str = today_dt.strftime("%d %B %Y")
-        
-        # 1. LAPIS PERTAMA: Query Tavily + Negative Keywords
-        clean_handles = [h.strip("@") for h in (req.handles or [])]
-        handles_query = " OR ".join([f'site:x.com/{h}' for h in clean_handles])
-        
-        search_query = (
-            f'({handles_query}) ("Barcelona" OR "Barça") '
-            f'-"GOAL" -"FULL TIME" -"HALF TIME" -"HAPPY BIRTHDAY" -"MATCHDAY" -"VAMOS"'
-        )
-        
+
+        clean_handles = [h.replace("@", "").strip() for h in (req.handles or []) if h.strip()]
+        if not clean_handles:
+            clean_handles = ["FabrizioRomano", "BarcaUniversal"]
+
+        handles_query = " OR ".join([f'"{h}"' for h in clean_handles])
+        search_query = f"({handles_query}) Barcelona news transfer"
+
         results = []
         if tavily:
-            # Menggunakan time_range="w" (7 hari terakhir) di Tavily API
-            search_result = await asyncio.to_thread(
-                tavily.search, 
-                query=search_query, 
-                max_results=req.max_results,
-                search_depth="advanced",
-                time_range="w"  # Restriksi pencarian HANYA 1 minggu (7 hari) terakhir
-            )
-            results = search_result.get("results", [])
+            try:
+                search_result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        tavily.search,
+                        query=search_query,
+                        max_results=int(req.max_results or 5),
+                        search_depth="basic",
+                    ),
+                    timeout=15.0,
+                )
+                results = search_result.get("results", [])
+            except asyncio.TimeoutError:
+                print("⚠️ [Tavily Warning]: Search timed out after 15 seconds.")
+                results = []
+            except Exception as t_err:
+                print(f"⚠️ [Tavily Error]: {t_err}")
+                results = []
 
         if not results:
             return {"success": True, "count": 0, "leads": []}
@@ -549,70 +557,56 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
             for item in results
         ])
 
-        # 2. LAPIS KEDUA: System Prompt Penyaringan Kategori & Rentang Waktu
         prompt = f"""
         Hari ini adalah tanggal {current_date_str} (ISO: {today_iso}).
         Kamu adalah Head Editor Berita Utama untuk portal berita olahraga 'barcainspo®'.
 
         TUGAS UTAMA:
         Analisis teks mentah hasil pemantauan dari X (Twitter) berikut ini.
-        Saring HANYA cuitan yang MEMILIKI VALUE BERITA UTAMA dan SANGAT LAYAK DIBAWA KE DRAFT ARTIKEL.
-
-        KRITERIA KETAT PENYARINGAN:
-
-        1. RENTANG WAKTU (MAXIMAL 5-7 HARI TERAKHIR):
-           - HANYA ambil postingan/berita/isu yang terjadi atau dipublikasikan dalam RENTANG WAKTU 5 HINGGA 7 HARI TERAKHIR dari hari ini ({current_date_str}).
-           - ABAIKAN dan BUANG semua isu/berita lama yang sudah berumur lebih dari 7 hari atau isu yang sudah basi/berlalu.
-
-        2. WAJIB LOLOS (BERITA BERHARGA & TERBARU):
-           - Rumor atau Kepastian Transfer (tawaran resmi, pembicaraan agen, minat klub, klausul rilis, negosiasi gaji).
-           - Perpanjangan & Pembaruan Kontrak pemain/pelatih.
-           - Berita Medis & Cedera (lama absen, kondisi operasi, jadwal kembalinya pemain).
-           - Pernyataan Resmi & Konferensi Pers (kata-kata Hansi Flick, Laporta, Deco, atau pemain).
-           - Isu Manajemen, Keuangan & FFP (Aturan 1:1 La Liga, pendaftaran pemain, sponsor utama, renovasi Camp Nou).
-           - Analisis taktik mendalam atau statistik rekor bermakna yang mengubah peta persaingan.
-
-        3. WAJIB DIBUANG / HARAM HUKUMNYA (TIDAK LOLOS):
-           - Isu/berita lama melebihi rentang 7 hari terakhir.
-           - Live Score / Update Skor Pertandingan (Contoh: "GOAL! Lewandowski 1-0", "Halftime: 0-0", "Starting XI Barca").
-           - Ucapan Ulang Tahun / Peringatan / Seremonial (Contoh: "Happy Birthday Gavi!", "Rest in peace...").
-           - Slogan Emosional / Text Pendek Tanpa Fakta Berita (Contoh: "Visca el Barça!", "Matchday!", "Vamos! 🔥").
-           - Promosi Toko, Merchandise, Tiket, Polling Fans, atau Giveaway.
-           - Opini Murni / Spekulasi Unverified dari Fans tanpa fakta jurnalis.
+        Saring HANYA cuitan yang MEMILIKI VALUE BERITA UTAMA FC BARCELONA dan SANGAT LAYAK DIBAWA KE DRAFT ARTIKEL.
 
         DATA MENTAH DARI X:
         ---
         {raw_text}
         ---
 
-        INSTRUKSI OUTPUT:
-        - Jika ada berita yang lolos kriteria waktu dan konten, susun menjadi ringkasan yang kaya informasi dan padat.
-        - Jika TIDAK ADA berita yang memenuhi kriteria, kembalikan array kosong: {{"leads": []}}.
-        - Kembalikan HANYA JSON MURNI tanpa format markdown triple backticks (```json) atau teks pengantar lainnya.
-
         STRUKTUR JSON MUSTI PERSIS SEPERTI INI:
         {{
             "leads": [
                 {{
-                    "sourceHandle": "@NamaHandle (misal: @FabrizioRomano)",
-                    "headline": "Judul berita yang padat, menarik, dan informatif dalam Bahasa Indonesia (1 kalimat)",
-                    "summary": "Ringkasan poin-poin fakta utama berita dalam Bahasa Indonesia (2-3 kalimat penjelasan mendalam)",
+                    "sourceHandle": "@{clean_handles[0]}",
+                    "headline": "Judul berita yang padat, menarik, dan informatif dalam Bahasa Indonesia",
+                    "summary": "Ringkasan poin-poin fakta utama berita dalam Bahasa Indonesia (2-3 kalimat)",
                     "rawContent": "Kutipan teks asli dari cuitan tersebut",
-                    "tweetUrl": "URL sumber asli jika ada dari data di atas, atau kosongi jika tidak ada",
+                    "tweetUrl": "URL sumber asli dari data di atas jika ada",
                     "createdAt": "{today_iso}"
                 }}
             ]
         }}
         """
 
-        raw_response = await call_gemini_with_fallback(prompt)
-        cleaned_response = clean_json_string(raw_response)
-        parsed_data = json.loads(cleaned_response)
-
-        leads_data = parsed_data.get("leads", [])
-        
-        if not isinstance(leads_data, list):
+        try:
+            raw_response = await asyncio.wait_for(
+                call_gemini_with_fallback(prompt),
+                timeout=30.0
+            )
+            cleaned_response = clean_json_string(raw_response)
+            parsed_data = json.loads(cleaned_response)
+            leads_data = parsed_data.get("leads", [])
+            if not isinstance(leads_data, list):
+                leads_data = []
+        except Exception as llm_err:
+            print(f"⚠️ [LLM Parsing Fallback]: {llm_err}")
             leads_data = []
+            for item in results[:3]:
+                leads_data.append({
+                    "sourceHandle": f"@{clean_handles[0]}",
+                    "headline": item.get("title", "Update Berita Terkini FC Barcelona"),
+                    "summary": item.get("content", "")[:200] + "...",
+                    "rawContent": item.get("content", ""),
+                    "tweetUrl": item.get("url", ""),
+                    "createdAt": today_iso,
+                })
 
         return {
             "success": True,
@@ -621,5 +615,9 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
         }
 
     except Exception as e:
-        print(f"[X-News Agent Error]: {e}")
-        raise HTTPException(status_code=500, detail=f"Gagal memproses X Agent: {str(e)}")
+        print(f"[X-News Agent Error Handled]: {e}")
+        return {
+            "success": False,
+            "count": 0,
+            "leads": []
+        }
