@@ -32,7 +32,6 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
-FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 
 REDIS_URL = os.getenv("KV_REST_API_URL")
 REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
@@ -71,41 +70,6 @@ def clean_json_string(text: str) -> str:
     text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
     return text.strip()
-
-
-def get_team_code(team_name: str) -> str:
-    """Mengembalikan singkatan resmi 3 huruf klub sepak bola populer."""
-    if not team_name:
-        return "OPP"
-    
-    name_lower = team_name.lower().strip()
-    mapping = {
-        "paris saint-germain": "PSG",
-        "paris saint germain": "PSG",
-        "psg": "PSG",
-        "real madrid": "RMA",
-        "galatasaray": "GAL",
-        "real betis": "BET",
-        "atletico madrid": "ATM",
-        "atletico de madrid": "ATM",
-        "athletic club": "ATH",
-        "athletic bilbao": "ATH",
-        "girona": "GIR",
-        "sevilla": "SEV",
-        "villarreal": "VIL",
-        "real sociedad": "RSO",
-        "manchester city": "MCI",
-        "bayern munich": "BAY",
-        "bayern munchen": "BAY",
-        "arsenal": "ARS",
-    }
-    
-    for key, code in mapping.items():
-        if key in name_lower:
-            return code
-            
-    clean = re.sub(r'[^a-zA-Z]', '', team_name)
-    return clean[:3].upper() if len(clean) >= 3 else "OPP"
 
 
 # ==========================================
@@ -288,21 +252,21 @@ def save_cache(data, expires_at: datetime):
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim resmi via API-Football CDN dengan fallback bersih."""
+    """Mengambil logo tim resmi via API-Football CDN dengan fallback cepat."""
     if not team_name:
         return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
     clean_name = team_name.strip()
-    encoded_name = urllib.parse.quote(clean_name)
 
     # 1. PERIKSA VIA API-FOOTBALL (Official HD Logos)
     if API_FOOTBALL_KEY:
         try:
+            encoded_name = urllib.parse.quote(clean_name)
             url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
             req = urllib.request.Request(
                 url,
                 headers={
-                    "x-apisports-key": API_FOOTBALL_KEY.strip(),
+                    "x-apisports-key": API_FOOTBALL_KEY,
                     "User-Agent": "Mozilla/5.0",
                 },
             )
@@ -320,6 +284,7 @@ def get_team_logo_dynamic(team_name: str) -> str:
 
     # 2. FALLBACK KE THESPORTSDB JIKA API-FOOTBALL TIMEOUT/KOSONG
     try:
+        encoded_name = urllib.parse.quote(clean_name)
         url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
@@ -333,7 +298,8 @@ def get_team_logo_dynamic(team_name: str) -> str:
         print(f"[TheSportsDB Warning] Gagal mengambil logo {clean_name}: {e}")
 
     # 3. FALLBACK TERAKHIR (UI Avatars)
-    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_name}&background=1e293b&color=ffffff&bold=true&rounded=true"
+    encoded_fallback = urllib.parse.quote(clean_name)
+    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
 # ==========================================
@@ -401,7 +367,6 @@ async def get_next_match():
 
         TUGAS UTAMA:
         Cari dan ekstrak 1 PERTANDINGAN TERDEKAT BARCELONA (tim utama pria) yang BELUM dimainkan setelah tanggal {current_date_str}.
-        DILARANG MELOMPATI JADWAL! Jika ada beberapa jadwal (contoh: UEFA Champions League tanggal 21 Oktober dan La Liga tanggal 25 Oktober), WAJIB AMBIL PERTANDINGAN YANG TANGGALNYA PALING AWAL / PALING DEKAT SECARA KRONOLOGIS SETELAH HARI INI.
 
         PERIKSA SELURUH KOMPETISI:
         - UEFA Champions League (UCL)
@@ -414,24 +379,22 @@ async def get_next_match():
         ---
 
         ATURAN PENULISAN & KONVERSI WAKTU:
-        1. "opponent": Nama resmi klub lawan (Contoh: "Paris Saint-Germain", "Real Betis", "Real Madrid").
-        2. "opponent_code": Singkatan resmi 3 huruf klub (Contoh: "PSG", "RMA", "GAL", "BET", "ATM").
-        3. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
-        4. "venue": Tulis "Home" atau "Away".
-        5. KONVERSI JAM KE WIB (UTC+7):
+        1. "opponent": Nama resmi klub lawan (Contoh: "Galatasaray", "Real Betis").
+        2. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
+        3. "venue": Tulis "Home" atau "Away".
+        4. KONVERSI JAM KE WIB (UTC+7):
            - Laga malam UEFA Champions League / La Liga biasanya dimulai jam 21:00 CEST (Waktu Spanyol).
            - 21:00 CEST setara tepat dengan jam 02:00 WIB (Bukan 03:00 WIB).
            - Pastikan jam kick-off diisi persis sesuai zona WIB resmi (contoh: "02:00 WIB" atau "23:30 WIB").
-        6. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "21 Oktober 2026").
-        7. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-21T02:00:00").
+        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "14 Oktober 2026").
+        6. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-14T02:00:00").
 
         KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
         {{
-            "opponent": "Paris Saint-Germain",
-            "opponent_code": "PSG",
-            "date": "21 Oktober 2026",
+            "opponent": "Galatasaray",
+            "date": "14 Oktober 2026",
             "time": "02:00 WIB",
-            "match_iso": "2026-10-21T02:00:00",
+            "match_iso": "2026-10-14T02:00:00",
             "competition": "UEFA Champions League",
             "venue": "Away"
         }}
@@ -445,18 +408,13 @@ async def get_next_match():
 
         # Fallback jika parsing LLM gagal/kosong
         if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 35:
-            parsed_data["opponent"] = "Paris Saint-Germain"
-            parsed_data["opponent_code"] = "PSG"
-            parsed_data["date"] = "21 Oktober 2026"
+            parsed_data["opponent"] = "Galatasaray"
+            parsed_data["date"] = "14 Oktober 2026"
             parsed_data["time"] = "02:00 WIB"
-            parsed_data["match_iso"] = "2026-10-21T02:00:00"
+            parsed_data["match_iso"] = "2026-10-14T02:00:00"
             parsed_data["competition"] = "UEFA Champions League"
             parsed_data["venue"] = "Away"
-            opponent_name = "Paris Saint-Germain"
-
-        # Memastikan kode singkatan tim tersedia
-        if not parsed_data.get("opponent_code"):
-            parsed_data["opponent_code"] = get_team_code(opponent_name)
+            opponent_name = "Galatasaray"
 
         # Fetch Logo Dinamis via API-Football
         opponent_logo_url = await asyncio.to_thread(
@@ -478,12 +436,16 @@ async def get_next_match():
             hours_until_kickoff = (kickoff_dt - now).total_seconds() / 3600
 
             if now >= match_end_dt:
+                # 1. Pertandingan sudah selesai (>3 jam setelah kick-off): langsung expire sekarang
                 expires_at = now
             elif now >= kickoff_dt - timedelta(hours=3) and now < match_end_dt:
+                # 2. Sedang bertanding: expire tepat setelah pertandingan usai
                 expires_at = match_end_dt
             elif hours_until_kickoff <= 24:
+                # 3. Mendekati pertandingan (<24 jam): update tiap 6 jam
                 expires_at = now + timedelta(hours=6)
             else:
+                # 4. Pertandingan masih lama (>24 jam): HEMAT TOKEN! Simpan cache selama 24 JAM (1 Hari)
                 expires_at = now + timedelta(hours=24)
 
         except Exception:
@@ -690,6 +652,7 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
             "leads": []
         }
 
+FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 
 # ==========================================
 # ENDPOINT KLASEMEN LA LIGA (FOOTBALL-DATA.ORG + REDIS 30 MIN)
@@ -723,7 +686,7 @@ async def get_la_liga_standings():
                 status_code=500, detail="FOOTBALL_DATA_API_KEY belum terpasang di .env"
             )
 
-        url = "[https://api.football-data.org/v4/competitions/PD/standings](https://api.football-data.org/v4/competitions/PD/standings)"
+        url = "https://api.football-data.org/v4/competitions/PD/standings"
         req = urllib.request.Request(
             url,
             headers={
