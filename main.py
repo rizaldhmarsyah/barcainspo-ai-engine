@@ -73,309 +73,39 @@ def clean_json_string(text: str) -> str:
     return text.strip()
 
 
-# ==========================================
-# MULTI-TIER AI FAILOVER MECHANISM
-# ==========================================
-async def call_mistral_fallback(prompt: str) -> str:
-    """Tier 3: Fallback paling akhir menggunakan Mistral AI."""
-    if not MISTRAL_API_KEY or not mistral_client:
-        raise Exception("MISTRAL_API_KEY belum terpasang atau client Mistral tidak aktif.")
-
-    mistral_models = ["mistral-small-latest", "open-mistral-7b"]
-
-    for model_name in mistral_models:
-        try:
-            print(f"[Mistral Fallback] Memproses request dengan model: {model_name}...")
-            response = await asyncio.to_thread(
-                mistral_client.chat.complete,
-                model=model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
-            if response and response.choices and response.choices[0].message.content:
-                return response.choices[0].message.content
-        except Exception as err:
-            print(f"[Mistral Warning] Model {model_name} gagal: {err}")
-
-    raise Exception("Seluruh model Mistral gagal merespons.")
-
-
-async def call_groq_fallback(prompt: str) -> str:
-    """Tier 2: Fallback ke model Groq."""
-    if not GROQ_API_KEY or not groq_client:
-        print("[Groq Skipped] GROQ_API_KEY belum terpasang.")
-    else:
-        groq_models = [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "qwen/qwen3.8-27b",
-            "allam-2-7b",
-        ]
-
-        for model_name in groq_models:
-            try:
-                print(f"[Groq Fallback] Memproses request dengan model: {model_name}...")
-                completion = await asyncio.to_thread(
-                    groq_client.chat.completions.create,
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta, tanpa markdown triple backticks.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.3,
-                )
-                if completion and completion.choices[0].message.content:
-                    return completion.choices[0].message.content
-            except Exception as err:
-                print(f"[Groq Warning] Model {model_name} gagal: {err}")
-
-    print("[Groq Failed] Semua model Groq gagal/di-skip. Dialihkan ke Mistral...")
-    return await call_mistral_fallback(prompt)
-
-
-async def call_gemini_with_fallback(prompt: str) -> str:
-    """Tier 1 -> Tier 2 -> Tier 3 AI Failover Flow."""
-    if client and GEMINI_API_KEY:
-        gemini_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-
-        for model_name in gemini_models:
-            try:
-                print(f"[Gemini Request] Memanggil {model_name}...")
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model_name,
-                    contents=prompt,
-                    config={"response_mime_type": "application/json"},
-                )
-                if response and response.text:
-                    return response.text
-            except Exception as e:
-                print(f"[Gemini Warning] {model_name} gagal: {e}")
-
-    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
-    try:
-        return await call_groq_fallback(prompt)
-    except Exception as fallback_err:
-        print(f"[AI Chain Error] Seluruh Provider AI gagal: {fallback_err}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Semua Provider AI (Gemini, Groq, & Mistral) gagal merespons: {str(fallback_err)}",
-        )
-
-
-# ==========================================
-# PYDANTIC SCHEMAS
-# ==========================================
-class ArticleGenerateRequest(BaseModel):
-    prompt: str
-    topic: Optional[str] = None
-    category: Optional[str] = "First Team"
-    mode: Optional[str] = "generate"
-
-
-class ArticleGenerateResponse(BaseModel):
-    title: str = Field(description="Judul artikel menarik SEO maks 110 karakter")
-    slug: str = Field(description="Slug URL kebab-case")
-    category: str = Field(description="Kategori berita")
-    excerpt: str = Field(description="Meta description SEO maks 160 karakter")
-    content: str = Field(description="Isi artikel multiparagraf dipisahkan dengan \\n\\n")
-    altText: str = Field(description="Alt text deskriptif untuk gambar cover")
-    imageCredit: str = Field(description="Sumber/kredit foto")
-    tags: str = Field(description="Tag dipisahkan koma, contoh: FC Barcelona, Hansi Flick, La Liga")
-
-
-class FieldRefineRequest(BaseModel):
-    field_type: str
-    current_value: str
-    instruction: str
-    topic: Optional[str] = None
-
-
-class FieldRefineResponse(BaseModel):
-    options: list[str] = Field(description="Daftar 3 variasi/revisi teks")
-
-
-class XNewsFetchRequest(BaseModel):
-    handles: Optional[List[str]] = ["FabrizioRomano", "gerardromero", "ToniJuanmarti", "ReshadFCB"]
-    max_results: Optional[int] = 5
-
-
-class XNewsLeadItem(BaseModel):
-    sourceHandle: str
-    headline: str
-    summary: str
-    rawContent: str
-    tweetUrl: Optional[str] = None
-    createdAt: str
-
-
-class XNewsFetchResponse(BaseModel):
-    success: bool
-    count: int
-    leads: List[XNewsLeadItem]
-
-
-# ==========================================
-# HELPER FUNCTIONS & LOGO API
-# ==========================================
-def load_cache():
-    if not redis_client:
-        return None
-    try:
-        data = redis_client.get("match_cache_v2")
-        if data:
-            if isinstance(data, str):
-                return json.loads(data)
-            return data
-    except Exception as e:
-        print(f"[Redis Load Error] Gagal membaca cache: {e}")
-    return None
-
-
-def save_cache(data, expires_at: datetime):
-    if not redis_client:
-        return
-    try:
-        cache_payload = {"expires_at": expires_at.isoformat(), "data": data}
-        redis_client.set("match_cache_v2", json.dumps(cache_payload))
-    except Exception as e:
-        print(f"[Redis Save Error] Gagal menyimpan cache: {e}")
-
-
-def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim secara murni dinamis via API tanpa kamus static/hardcoded."""
+def get_team_code(team_name: str) -> str:
+    """Mengembalikan singkatan resmi 3 huruf klub sepak bola populer."""
     if not team_name:
-        return "[https://ui-avatars.com/api/?name=OPP&background=000000&color=ffffff&bold=true](https://ui-avatars.com/api/?name=OPP&background=000000&color=ffffff&bold=true)"
-
-    clean_name = team_name.strip()
-    encoded_name = urllib.parse.quote(clean_name)
-
-    # 1. CARI DINAMIS VIA API-FOOTBALL (Official HD Logos)
-    if API_FOOTBALL_KEY:
-        try:
-            url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "x-apisports-key": API_FOOTBALL_KEY.strip(),
-                    "User-Agent": "Mozilla/5.0",
-                },
-            )
-
-            with urllib.request.urlopen(req, timeout=4) as response:
-                data = json.loads(response.read().decode())
-                if data and data.get("response") and len(data["response"]) > 0:
-                    team_info = data["response"][0].get("team", {})
-                    logo_url = team_info.get("logo")
-                    if logo_url and logo_url.startswith("http"):
-                        print(f"[Logo Success] Logo ditemukan via API-Football untuk: {clean_name}")
-                        return logo_url
-        except Exception as e:
-            print(f"[API-Football Warning] Gagal mengambil logo {clean_name}: {e}")
-
-    # 2. CARI DINAMIS VIA THESPORTSDB JIKA API-FOOTBALL GAGAL
-    try:
-        url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = json.loads(response.read().decode())
-            if data and data.get("teams") and len(data["teams"]) > 0:
-                badge_url = data["teams"][0].get("strBadge")
-                if badge_url and badge_url.startswith("http"):
-                    print(f"[Logo Success] Logo ditemukan via TheSportsDB untuk: {clean_name}")
-                    return badge_url
-    except Exception as e:
-        printBerikut adalah full code **`main.py`** yang sudah diperbarui secara menyeluruh:
-
-* **Tanpa Hardcoded Logo**: Seluruh fallback ID Galatasaray (`610.png`) dan dictionary static telah dihapus.
-* **100% Dynamic Logo Lookup**: `get_team_logo_dynamic` kini mencari logo klub secara murni via API-Football $\rightarrow$ TheSportsDB $\rightarrow$ UI Avatars dinamis sesuai nama lawan yang dikirim.
-* **Football-Data.org Integrasi**: Endpoint `/api/standings` menggunakan `api.football-data.org` dengan Redis caching 30 menit.
-
-```python
-import os
-import re
-import json
-import asyncio
-import warnings
-import urllib.parse
-import urllib.request
-from typing import Optional, List
-from datetime import datetime, timedelta
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from google import genai
-from groq import Groq
-from tavily import TavilyClient
-from upstash_redis import Redis
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
-
-load_dotenv()
-
-app = FastAPI(title="Barcainspo AI Engine")
-
-# ==========================================
-# ENV & CLIENT INITIALIZATION
-# ==========================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
-FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
-
-REDIS_URL = os.getenv("KV_REST_API_URL")
-REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
-
-redis_client = None
-if REDIS_URL and REDIS_TOKEN:
-    redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-mistral_client = None
-if MISTRAL_API_KEY:
-    try:
-        from mistralai import Mistral
-        mistral_client = Mistral(api_key=MISTRAL_API_KEY)
-    except ImportError:
-        print("[Warning] Package 'mistralai' belum terinstall. Install via: pip install mistralai")
-
-
-def clean_json_string(text: str) -> str:
-    """Membersihkan markdown code blocks agar json.loads() tidak crash."""
-    if not text:
-        return ""
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
-    return text.strip()
+        return "OPP"
+    
+    name_lower = team_name.lower().strip()
+    mapping = {
+        "paris saint-germain": "PSG",
+        "paris saint germain": "PSG",
+        "psg": "PSG",
+        "real madrid": "RMA",
+        "galatasaray": "GAL",
+        "real betis": "BET",
+        "atletico madrid": "ATM",
+        "atletico de madrid": "ATM",
+        "athletic club": "ATH",
+        "athletic bilbao": "ATH",
+        "girona": "GIR",
+        "sevilla": "SEV",
+        "villarreal": "VIL",
+        "real sociedad": "RSO",
+        "manchester city": "MCI",
+        "bayern munich": "BAY",
+        "bayern munchen": "BAY",
+        "arsenal": "ARS",
+    }
+    
+    for key, code in mapping.items():
+        if key in name_lower:
+            return code
+            
+    clean = re.sub(r'[^a-zA-Z]', '', team_name)
+    return clean[:3].upper() if len(clean) >= 3 else "OPP"
 
 
 # ==========================================
@@ -558,14 +288,14 @@ def save_cache(data, expires_at: datetime):
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim secara murni dinamis via API tanpa kamus static/hardcoded."""
+    """Mengambil logo tim resmi via API-Football CDN dengan fallback bersih."""
     if not team_name:
-        return "[https://ui-avatars.com/api/?name=OPP&background=000000&color=ffffff&bold=true](https://ui-avatars.com/api/?name=OPP&background=000000&color=ffffff&bold=true)"
+        return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
     clean_name = team_name.strip()
     encoded_name = urllib.parse.quote(clean_name)
 
-    # 1. CARI DINAMIS VIA API-FOOTBALL (Official HD Logos)
+    # 1. PERIKSA VIA API-FOOTBALL (Official HD Logos)
     if API_FOOTBALL_KEY:
         try:
             url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
@@ -588,7 +318,7 @@ def get_team_logo_dynamic(team_name: str) -> str:
         except Exception as e:
             print(f"[API-Football Warning] Gagal mengambil logo {clean_name}: {e}")
 
-    # 2. CARI DINAMIS VIA THESPORTSDB JIKA API-FOOTBALL GAGAL
+    # 2. FALLBACK KE THESPORTSDB JIKA API-FOOTBALL TIMEOUT/KOSONG
     try:
         url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -598,13 +328,12 @@ def get_team_logo_dynamic(team_name: str) -> str:
             if data and data.get("teams") and len(data["teams"]) > 0:
                 badge_url = data["teams"][0].get("strBadge")
                 if badge_url and badge_url.startswith("http"):
-                    print(f"[Logo Success] Logo ditemukan via TheSportsDB untuk: {clean_name}")
                     return badge_url
     except Exception as e:
         print(f"[TheSportsDB Warning] Gagal mengambil logo {clean_name}: {e}")
 
-    # 3. FALLBACK DINAMIS (Menggunakan nama tim lawan)
-    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_name}&background=000000&color=ffffff&bold=true"
+    # 3. FALLBACK TERAKHIR (UI Avatars)
+    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_name}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
 # ==========================================
@@ -672,6 +401,7 @@ async def get_next_match():
 
         TUGAS UTAMA:
         Cari dan ekstrak 1 PERTANDINGAN TERDEKAT BARCELONA (tim utama pria) yang BELUM dimainkan setelah tanggal {current_date_str}.
+        DILARANG MELOMPATI JADWAL! Jika ada beberapa jadwal (contoh: UEFA Champions League tanggal 21 Oktober dan La Liga tanggal 25 Oktober), WAJIB AMBIL PERTANDINGAN YANG TANGGALNYA PALING AWAL / PALING DEKAT SECARA KRONOLOGIS SETELAH HARI INI.
 
         PERIKSA SELURUH KOMPETISI:
         - UEFA Champions League (UCL)
@@ -684,19 +414,21 @@ async def get_next_match():
         ---
 
         ATURAN PENULISAN & KONVERSI WAKTU:
-        1. "opponent": Nama resmi klub lawan (Contoh: "Paris Saint-Germain", "Real Betis").
-        2. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
-        3. "venue": Tulis "Home" atau "Away".
-        4. KONVERSI JAM KE WIB (UTC+7):
+        1. "opponent": Nama resmi klub lawan (Contoh: "Paris Saint-Germain", "Real Betis", "Real Madrid").
+        2. "opponent_code": Singkatan resmi 3 huruf klub (Contoh: "PSG", "RMA", "GAL", "BET", "ATM").
+        3. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
+        4. "venue": Tulis "Home" atau "Away".
+        5. KONVERSI JAM KE WIB (UTC+7):
            - Laga malam UEFA Champions League / La Liga biasanya dimulai jam 21:00 CEST (Waktu Spanyol).
            - 21:00 CEST setara tepat dengan jam 02:00 WIB (Bukan 03:00 WIB).
            - Pastikan jam kick-off diisi persis sesuai zona WIB resmi (contoh: "02:00 WIB" atau "23:30 WIB").
-        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "21 Oktober 2026").
-        6. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-21T02:00:00").
+        6. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "21 Oktober 2026").
+        7. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-21T02:00:00").
 
         KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
         {{
             "opponent": "Paris Saint-Germain",
+            "opponent_code": "PSG",
             "date": "21 Oktober 2026",
             "time": "02:00 WIB",
             "match_iso": "2026-10-21T02:00:00",
@@ -714,6 +446,7 @@ async def get_next_match():
         # Fallback jika parsing LLM gagal/kosong
         if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 35:
             parsed_data["opponent"] = "Paris Saint-Germain"
+            parsed_data["opponent_code"] = "PSG"
             parsed_data["date"] = "21 Oktober 2026"
             parsed_data["time"] = "02:00 WIB"
             parsed_data["match_iso"] = "2026-10-21T02:00:00"
@@ -721,7 +454,11 @@ async def get_next_match():
             parsed_data["venue"] = "Away"
             opponent_name = "Paris Saint-Germain"
 
-        # Fetch Logo Dinamis via API
+        # Memastikan kode singkatan tim tersedia
+        if not parsed_data.get("opponent_code"):
+            parsed_data["opponent_code"] = get_team_code(opponent_name)
+
+        # Fetch Logo Dinamis via API-Football
         opponent_logo_url = await asyncio.to_thread(
             get_team_logo_dynamic, opponent_name
         )
@@ -741,16 +478,12 @@ async def get_next_match():
             hours_until_kickoff = (kickoff_dt - now).total_seconds() / 3600
 
             if now >= match_end_dt:
-                # 1. Pertandingan sudah selesai (>3 jam setelah kick-off): langsung expire sekarang
                 expires_at = now
             elif now >= kickoff_dt - timedelta(hours=3) and now < match_end_dt:
-                # 2. Sedang bertanding: expire tepat setelah pertandingan usai
                 expires_at = match_end_dt
             elif hours_until_kickoff <= 24:
-                # 3. Mendekati pertandingan (<24 jam): update tiap 6 jam
                 expires_at = now + timedelta(hours=6)
             else:
-                # 4. Pertandingan masih lama (>24 jam): HEMAT TOKEN! Simpan cache selama 24 JAM (1 Hari)
                 expires_at = now + timedelta(hours=24)
 
         except Exception:
