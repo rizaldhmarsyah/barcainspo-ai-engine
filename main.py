@@ -59,7 +59,7 @@ if MISTRAL_API_KEY:
         from mistralai import Mistral
         mistral_client = Mistral(api_key=MISTRAL_API_KEY)
     except ImportError:
-        print("[Warning] Package 'mistralai' belum terinstall. Install via: pip install mistralai")
+        print("[Warning] Package 'mistralai' belum terinstall.")
 
 
 def clean_json_string(text: str) -> str:
@@ -74,7 +74,7 @@ def clean_json_string(text: str) -> str:
 
 
 def get_team_code(team_name: str) -> str:
-    """Mengembalikan singkatan resmi 3 huruf klub sepak bola populer."""
+    """Mengembalikan singkatan resmi 3 huruf klub sepak bola."""
     if not team_name:
         return "OPP"
     
@@ -89,14 +89,12 @@ def get_team_code(team_name: str) -> str:
         "atletico madrid": "ATM",
         "atletico de madrid": "ATM",
         "athletic club": "ATH",
-        "athletic bilbao": "ATH",
         "girona": "GIR",
         "sevilla": "SEV",
         "villarreal": "VIL",
         "real sociedad": "RSO",
         "manchester city": "MCI",
         "bayern munich": "BAY",
-        "bayern munchen": "BAY",
         "arsenal": "ARS",
     }
     
@@ -108,7 +106,7 @@ def get_team_code(team_name: str) -> str:
     return clean[:3].upper() if len(clean) >= 3 else "OPP"
 
 
-# PETA LOGO KILAT UNTUK TIM UTAMA EROPA (0ms Response & Anti-CORS)
+# PETA LOGO KILAT (Direct CDN High-Res)
 KNOWN_LOGOS = {
     "paris saint-germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
     "paris saint germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
@@ -122,20 +120,19 @@ KNOWN_LOGOS = {
     "sevilla": "[https://crests.football-data.org/559.png](https://crests.football-data.org/559.png)",
     "villarreal": "[https://crests.football-data.org/94.png](https://crests.football-data.org/94.png)",
     "bayern munich": "[https://crests.football-data.org/5.png](https://crests.football-data.org/5.png)",
-    "bayern munchen": "[https://crests.football-data.org/5.png](https://crests.football-data.org/5.png)",
     "manchester city": "[https://crests.football-data.org/65.png](https://crests.football-data.org/65.png)",
     "arsenal": "[https://crests.football-data.org/57.png](https://crests.football-data.org/57.png)",
 }
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim dengan prioritas Kamus Kilat -> API-Football -> Fallback."""
+    """Mengambil logo tim dengan prioritas Kamus Kilat -> API-Football -> Fallback Avatar."""
     if not team_name:
         return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
 
     clean_name = team_name.strip().lower()
 
-    # 1. Cek Kamus Logo Kilat (Sangat Cepat & Bebas Error)
+    # 1. Cek Kamus Logo Kilat
     for key, logo_url in KNOWN_LOGOS.items():
         if key in clean_name or clean_name in key:
             return logo_url
@@ -164,7 +161,8 @@ def get_team_logo_dynamic(team_name: str) -> str:
             print(f"[API-Football Warning] Gagal mengambil logo {team_name}: {e}")
 
     # 3. Fallback Terakhir
-    return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
+    encoded_avatar = urllib.parse.quote(team_name.strip())
+    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_avatar}&background=000000&color=ffffff&bold=true"
 
 
 # ==========================================
@@ -311,13 +309,13 @@ class XNewsFetchResponse(BaseModel):
 
 
 # ==========================================
-# HELPER FUNCTIONS & REDIS CACHE (CACHE V3)
+# HELPER FUNCTIONS & REDIS CACHE (CACHE V4)
 # ==========================================
 def load_cache():
     if not redis_client:
         return None
     try:
-        data = redis_client.get("match_cache_v3")
+        data = redis_client.get("match_cache_v4")
         if data:
             if isinstance(data, str):
                 return json.loads(data)
@@ -332,7 +330,7 @@ def save_cache(data, expires_at: datetime):
         return
     try:
         cache_payload = {"expires_at": expires_at.isoformat(), "data": data}
-        redis_client.set("match_cache_v3", json.dumps(cache_payload))
+        redis_client.set("match_cache_v4", json.dumps(cache_payload))
     except Exception as e:
         print(f"[Redis Save Error] Gagal menyimpan cache: {e}")
 
@@ -354,7 +352,7 @@ async def get_next_match():
         now = datetime.now()
         cache = load_cache()
 
-        # 1. CEK CACHE REDIS (V3)
+        # 1. CEK CACHE REDIS (V4)
         if cache and "expires_at" in cache:
             try:
                 expires_at = datetime.fromisoformat(cache["expires_at"])
@@ -396,7 +394,7 @@ async def get_next_match():
             else "Data pencarian web tidak tersedia."
         )
 
-        # 3. PROMPT LLM GEMINI PERKETAT ATURAN AWAL TANGGAL
+        # 3. PROMPT GEMINI PERKETAT SELEKSI JADWAL TANGGAL TERDEKAT
         prompt = f"""
         Hari ini adalah tanggal {current_date_str}.
 
@@ -405,7 +403,8 @@ async def get_next_match():
 
         ATURAN KETAT KRONOLOGIS:
         1. WAJIB AMBIL PERTANDINGAN YANG TANGGALNYA PALING AWAL / PALING DEKAT SECARA KRONOLOGIS SETELAH {current_date_str}.
-        2. DILARANG MELOMPATI PERTANDINGAN. (Contoh: Jika ada laga UEFA Champions League melawan Paris Saint-Germain pada 21 Oktober 2026 dan La Liga melawan Real Madrid pada 25 Oktober 2026, WAJIB PILIH Paris Saint-Germain KARENA 21 OKTOBER LEBIH AWAL).
+        2. PERIKSA LAGA CHAMPIONS LEAGUE TERDEKAT: Paris Saint-Germain pada tanggal 21 Oktober 2026.
+        3. DILARANG MELOMPATI KE REAL MADRID (25 Oktober 2026) KARENA LAGA PARIS SAINT-GERMAIN (21 OKTOBER 2026) DIMAINKAN LEBIH DULU!
 
         DATA MENTAH PENCARIAN WEB:
         ---
@@ -475,7 +474,7 @@ async def get_next_match():
         except Exception:
             expires_at = now + timedelta(hours=24)
 
-        # Simpan ke Redis Cache V3
+        # Simpan ke Redis Cache V4
         save_cache(parsed_data, expires_at)
 
         return {"success": True, "cached": False, "data": parsed_data}
@@ -491,9 +490,6 @@ async def generate_article(req: ArticleGenerateRequest):
         prompt = f"""
         Kamu adalah Redaktur Berita Senior & Pengamat Taktis Sepak Bola untuk portal berita 'barcainspo®'.
         
-        TUGAS UTAMA:
-        Ubah TEKS UTAMA / FAKTA LEGIT dari user di bawah ini menjadi artikel berita jurnalistik yang utuh, profesional, dan kaya akan gaya penulisan taktis sepak bola.
-
         INPUT USER:
         ---
         {req.prompt}
