@@ -32,6 +32,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
+FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 
 REDIS_URL = os.getenv("KV_REST_API_URL")
 REDIS_TOKEN = os.getenv("KV_REST_API_TOKEN")
@@ -72,11 +73,104 @@ def clean_json_string(text: str) -> str:
     return text.strip()
 
 
+def get_team_code(team_name: str) -> str:
+    """Mengembalikan singkatan resmi 3 huruf klub sepak bola populer."""
+    if not team_name:
+        return "OPP"
+    
+    name_lower = team_name.lower().strip()
+    mapping = {
+        "paris saint-germain": "PSG",
+        "paris saint germain": "PSG",
+        "psg": "PSG",
+        "real madrid": "RMA",
+        "galatasaray": "GAL",
+        "real betis": "BET",
+        "atletico madrid": "ATM",
+        "atletico de madrid": "ATM",
+        "athletic club": "ATH",
+        "athletic bilbao": "ATH",
+        "girona": "GIR",
+        "sevilla": "SEV",
+        "villarreal": "VIL",
+        "real sociedad": "RSO",
+        "manchester city": "MCI",
+        "bayern munich": "BAY",
+        "bayern munchen": "BAY",
+        "arsenal": "ARS",
+    }
+    
+    for key, code in mapping.items():
+        if key in name_lower:
+            return code
+            
+    clean = re.sub(r'[^a-zA-Z]', '', team_name)
+    return clean[:3].upper() if len(clean) >= 3 else "OPP"
+
+
+# PETA LOGO KILAT UNTUK TIM UTAMA EROPA (0ms Response & Anti-CORS)
+KNOWN_LOGOS = {
+    "paris saint-germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
+    "paris saint germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
+    "psg": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
+    "real madrid": "[https://crests.football-data.org/86.png](https://crests.football-data.org/86.png)",
+    "galatasaray": "[https://crests.football-data.org/610.png](https://crests.football-data.org/610.png)",
+    "real betis": "[https://crests.football-data.org/90.png](https://crests.football-data.org/90.png)",
+    "betis": "[https://crests.football-data.org/90.png](https://crests.football-data.org/90.png)",
+    "atletico madrid": "[https://crests.football-data.org/78.png](https://crests.football-data.org/78.png)",
+    "girona": "[https://crests.football-data.org/298.png](https://crests.football-data.org/298.png)",
+    "sevilla": "[https://crests.football-data.org/559.png](https://crests.football-data.org/559.png)",
+    "villarreal": "[https://crests.football-data.org/94.png](https://crests.football-data.org/94.png)",
+    "bayern munich": "[https://crests.football-data.org/5.png](https://crests.football-data.org/5.png)",
+    "bayern munchen": "[https://crests.football-data.org/5.png](https://crests.football-data.org/5.png)",
+    "manchester city": "[https://crests.football-data.org/65.png](https://crests.football-data.org/65.png)",
+    "arsenal": "[https://crests.football-data.org/57.png](https://crests.football-data.org/57.png)",
+}
+
+
+def get_team_logo_dynamic(team_name: str) -> str:
+    """Mengambil logo tim dengan prioritas Kamus Kilat -> API-Football -> Fallback."""
+    if not team_name:
+        return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
+
+    clean_name = team_name.strip().lower()
+
+    # 1. Cek Kamus Logo Kilat (Sangat Cepat & Bebas Error)
+    for key, logo_url in KNOWN_LOGOS.items():
+        if key in clean_name or clean_name in key:
+            return logo_url
+
+    # 2. Cari Dinamis via API-Football
+    if API_FOOTBALL_KEY:
+        try:
+            encoded_name = urllib.parse.quote(team_name.strip())
+            url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "x-apisports-key": API_FOOTBALL_KEY.strip(),
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = json.loads(response.read().decode())
+                if data and data.get("response") and len(data["response"]) > 0:
+                    team_info = data["response"][0].get("team", {})
+                    logo_url = team_info.get("logo")
+                    if logo_url and logo_url.startswith("http"):
+                        return logo_url
+        except Exception as e:
+            print(f"[API-Football Warning] Gagal mengambil logo {team_name}: {e}")
+
+    # 3. Fallback Terakhir
+    return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
+
+
 # ==========================================
 # MULTI-TIER AI FAILOVER MECHANISM
 # ==========================================
 async def call_mistral_fallback(prompt: str) -> str:
-    """Tier 3: Fallback paling akhir menggunakan Mistral AI."""
     if not MISTRAL_API_KEY or not mistral_client:
         raise Exception("MISTRAL_API_KEY belum terpasang atau client Mistral tidak aktif.")
 
@@ -84,14 +178,13 @@ async def call_mistral_fallback(prompt: str) -> str:
 
     for model_name in mistral_models:
         try:
-            print(f"[Mistral Fallback] Memproses request dengan model: {model_name}...")
             response = await asyncio.to_thread(
                 mistral_client.chat.complete,
                 model=model_name,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta.",
+                        "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI.",
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -106,7 +199,6 @@ async def call_mistral_fallback(prompt: str) -> str:
 
 
 async def call_groq_fallback(prompt: str) -> str:
-    """Tier 2: Fallback ke model Groq."""
     if not GROQ_API_KEY or not groq_client:
         print("[Groq Skipped] GROQ_API_KEY belum terpasang.")
     else:
@@ -119,14 +211,13 @@ async def call_groq_fallback(prompt: str) -> str:
 
         for model_name in groq_models:
             try:
-                print(f"[Groq Fallback] Memproses request dengan model: {model_name}...")
                 completion = await asyncio.to_thread(
                     groq_client.chat.completions.create,
                     model=model_name,
                     messages=[
                         {
                             "role": "system",
-                            "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI yang valid sesuai format yang diminta, tanpa markdown triple backticks.",
+                            "content": "Kamu adalah API pendukung portal berita 'barcainspo®'. KELUARKAN HANYA JSON MURNI.",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -138,18 +229,15 @@ async def call_groq_fallback(prompt: str) -> str:
             except Exception as err:
                 print(f"[Groq Warning] Model {model_name} gagal: {err}")
 
-    print("[Groq Failed] Semua model Groq gagal/di-skip. Dialihkan ke Mistral...")
     return await call_mistral_fallback(prompt)
 
 
 async def call_gemini_with_fallback(prompt: str) -> str:
-    """Tier 1 -> Tier 2 -> Tier 3 AI Failover Flow."""
     if client and GEMINI_API_KEY:
         gemini_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
         for model_name in gemini_models:
             try:
-                print(f"[Gemini Request] Memanggil {model_name}...")
                 response = await asyncio.to_thread(
                     client.models.generate_content,
                     model=model_name,
@@ -161,14 +249,12 @@ async def call_gemini_with_fallback(prompt: str) -> str:
             except Exception as e:
                 print(f"[Gemini Warning] {model_name} gagal: {e}")
 
-    print("[Gemini Failed] Semua model Gemini sibuk/error. Dialihkan ke Groq...")
     try:
         return await call_groq_fallback(prompt)
     except Exception as fallback_err:
-        print(f"[AI Chain Error] Seluruh Provider AI gagal: {fallback_err}")
         raise HTTPException(
             status_code=500,
-            detail=f"Semua Provider AI (Gemini, Groq, & Mistral) gagal merespons: {str(fallback_err)}",
+            detail=f"Semua Provider AI gagal merespons: {str(fallback_err)}",
         )
 
 
@@ -225,13 +311,13 @@ class XNewsFetchResponse(BaseModel):
 
 
 # ==========================================
-# HELPER FUNCTIONS & LOGO API
+# HELPER FUNCTIONS & REDIS CACHE (CACHE V3)
 # ==========================================
 def load_cache():
     if not redis_client:
         return None
     try:
-        data = redis_client.get("match_cache_v2")
+        data = redis_client.get("match_cache_v3")
         if data:
             if isinstance(data, str):
                 return json.loads(data)
@@ -246,60 +332,9 @@ def save_cache(data, expires_at: datetime):
         return
     try:
         cache_payload = {"expires_at": expires_at.isoformat(), "data": data}
-        redis_client.set("match_cache_v2", json.dumps(cache_payload))
+        redis_client.set("match_cache_v3", json.dumps(cache_payload))
     except Exception as e:
         print(f"[Redis Save Error] Gagal menyimpan cache: {e}")
-
-
-def get_team_logo_dynamic(team_name: str) -> str:
-    """Mengambil logo tim resmi via API-Football CDN dengan fallback cepat."""
-    if not team_name:
-        return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
-
-    clean_name = team_name.strip()
-
-    # 1. PERIKSA VIA API-FOOTBALL (Official HD Logos)
-    if API_FOOTBALL_KEY:
-        try:
-            encoded_name = urllib.parse.quote(clean_name)
-            url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "x-apisports-key": API_FOOTBALL_KEY,
-                    "User-Agent": "Mozilla/5.0",
-                },
-            )
-
-            with urllib.request.urlopen(req, timeout=4) as response:
-                data = json.loads(response.read().decode())
-                if data and data.get("response") and len(data["response"]) > 0:
-                    team_info = data["response"][0].get("team", {})
-                    logo_url = team_info.get("logo")
-                    if logo_url and logo_url.startswith("http"):
-                        print(f"[Logo Success] Logo ditemukan via API-Football untuk: {clean_name}")
-                        return logo_url
-        except Exception as e:
-            print(f"[API-Football Warning] Gagal mengambil logo {clean_name}: {e}")
-
-    # 2. FALLBACK KE THESPORTSDB JIKA API-FOOTBALL TIMEOUT/KOSONG
-    try:
-        encoded_name = urllib.parse.quote(clean_name)
-        url = f"[https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=](https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=){encoded_name}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = json.loads(response.read().decode())
-            if data and data.get("teams") and len(data["teams"]) > 0:
-                badge_url = data["teams"][0].get("strBadge")
-                if badge_url and badge_url.startswith("http"):
-                    return badge_url
-    except Exception as e:
-        print(f"[TheSportsDB Warning] Gagal mengambil logo {clean_name}: {e}")
-
-    # 3. FALLBACK TERAKHIR (UI Avatars)
-    encoded_fallback = urllib.parse.quote(clean_name)
-    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_fallback}&background=1e293b&color=ffffff&bold=true&rounded=true"
 
 
 # ==========================================
@@ -319,7 +354,7 @@ async def get_next_match():
         now = datetime.now()
         cache = load_cache()
 
-        # 1. CEK CACHE REDIS
+        # 1. CEK CACHE REDIS (V3)
         if cache and "expires_at" in cache:
             try:
                 expires_at = datetime.fromisoformat(cache["expires_at"])
@@ -334,7 +369,7 @@ async def get_next_match():
 
         current_date_str = now.strftime("%d %B %Y")
         
-        # 2. QUERY TAVILY SEARCH (Pencarian Seluruh Kompetisi)
+        # 2. QUERY TAVILY SEARCH
         search_query = (
             f"FC Barcelona upcoming fixture schedule Champions League La Liga "
             f"date kick off time 2026 after {current_date_str}"
@@ -361,40 +396,29 @@ async def get_next_match():
             else "Data pencarian web tidak tersedia."
         )
 
-        # 3. PROMPT LLM GEMINI
+        # 3. PROMPT LLM GEMINI PERKETAT ATURAN AWAL TANGGAL
         prompt = f"""
         Hari ini adalah tanggal {current_date_str}.
 
         TUGAS UTAMA:
         Cari dan ekstrak 1 PERTANDINGAN TERDEKAT BARCELONA (tim utama pria) yang BELUM dimainkan setelah tanggal {current_date_str}.
 
-        PERIKSA SELURUH KOMPETISI:
-        - UEFA Champions League (UCL)
-        - La Liga
-        - Copa del Rey / Supercopa
+        ATURAN KETAT KRONOLOGIS:
+        1. WAJIB AMBIL PERTANDINGAN YANG TANGGALNYA PALING AWAL / PALING DEKAT SECARA KRONOLOGIS SETELAH {current_date_str}.
+        2. DILARANG MELOMPATI PERTANDINGAN. (Contoh: Jika ada laga UEFA Champions League melawan Paris Saint-Germain pada 21 Oktober 2026 dan La Liga melawan Real Madrid pada 25 Oktober 2026, WAJIB PILIH Paris Saint-Germain KARENA 21 OKTOBER LEBIH AWAL).
 
         DATA MENTAH PENCARIAN WEB:
         ---
         {raw_text}
         ---
 
-        ATURAN PENULISAN & KONVERSI WAKTU:
-        1. "opponent": Nama resmi klub lawan (Contoh: "Galatasaray", "Real Betis").
-        2. "competition": Nama kompetisi (Contoh: "UEFA Champions League" atau "La Liga").
-        3. "venue": Tulis "Home" atau "Away".
-        4. KONVERSI JAM KE WIB (UTC+7):
-           - Laga malam UEFA Champions League / La Liga biasanya dimulai jam 21:00 CEST (Waktu Spanyol).
-           - 21:00 CEST setara tepat dengan jam 02:00 WIB (Bukan 03:00 WIB).
-           - Pastikan jam kick-off diisi persis sesuai zona WIB resmi (contoh: "02:00 WIB" atau "23:30 WIB").
-        5. "date": Tulis tanggal lengkap WIB dalam Bahasa Indonesia (contoh: "14 Oktober 2026").
-        6. "match_iso": Format ISO 8601 standar waktu WIB (contoh: "2026-10-14T02:00:00").
-
-        KEMBALIKAN HANYA JSON MURNI DENGAN STRUKTUR:
+        STRUKTUR JSON MUSTI PERSIS SEPERTI INI:
         {{
-            "opponent": "Galatasaray",
-            "date": "14 Oktober 2026",
+            "opponent": "Paris Saint-Germain",
+            "opponent_code": "PSG",
+            "date": "21 Oktober 2026",
             "time": "02:00 WIB",
-            "match_iso": "2026-10-14T02:00:00",
+            "match_iso": "2026-10-21T02:00:00",
             "competition": "UEFA Champions League",
             "venue": "Away"
         }}
@@ -406,17 +430,21 @@ async def get_next_match():
 
         opponent_name = parsed_data.get("opponent", "")
 
-        # Fallback jika parsing LLM gagal/kosong
+        # Fallback proteksi jika AI gagal parsing
         if not opponent_name or "tidak ditemukan" in opponent_name.lower() or len(opponent_name) > 35:
-            parsed_data["opponent"] = "Galatasaray"
-            parsed_data["date"] = "14 Oktober 2026"
+            parsed_data["opponent"] = "Paris Saint-Germain"
+            parsed_data["opponent_code"] = "PSG"
+            parsed_data["date"] = "21 Oktober 2026"
             parsed_data["time"] = "02:00 WIB"
-            parsed_data["match_iso"] = "2026-10-14T02:00:00"
+            parsed_data["match_iso"] = "2026-10-21T02:00:00"
             parsed_data["competition"] = "UEFA Champions League"
             parsed_data["venue"] = "Away"
-            opponent_name = "Galatasaray"
+            opponent_name = "Paris Saint-Germain"
 
-        # Fetch Logo Dinamis via API-Football
+        # Pastikan kode singkatan tim terisi resmi
+        parsed_data["opponent_code"] = get_team_code(opponent_name)
+
+        # Fetch Logo Dinamis & Cepat
         opponent_logo_url = await asyncio.to_thread(
             get_team_logo_dynamic, opponent_name
         )
@@ -424,7 +452,7 @@ async def get_next_match():
         parsed_data["barca_logo"] = "[https://crests.football-data.org/81.png](https://crests.football-data.org/81.png)"
         parsed_data["opponent_logo"] = opponent_logo_url
 
-        # 4. LOGIKA SMART CACHE (DYNAMICAL & TOKEN SAVER)
+        # 4. LOGIKA SMART CACHE
         try:
             match_iso_str = parsed_data.get("match_iso")
             if match_iso_str:
@@ -436,22 +464,18 @@ async def get_next_match():
             hours_until_kickoff = (kickoff_dt - now).total_seconds() / 3600
 
             if now >= match_end_dt:
-                # 1. Pertandingan sudah selesai (>3 jam setelah kick-off): langsung expire sekarang
                 expires_at = now
             elif now >= kickoff_dt - timedelta(hours=3) and now < match_end_dt:
-                # 2. Sedang bertanding: expire tepat setelah pertandingan usai
                 expires_at = match_end_dt
             elif hours_until_kickoff <= 24:
-                # 3. Mendekati pertandingan (<24 jam): update tiap 6 jam
                 expires_at = now + timedelta(hours=6)
             else:
-                # 4. Pertandingan masih lama (>24 jam): HEMAT TOKEN! Simpan cache selama 24 JAM (1 Hari)
                 expires_at = now + timedelta(hours=24)
 
         except Exception:
             expires_at = now + timedelta(hours=24)
 
-        # Simpan ke Redis
+        # Simpan ke Redis Cache V3
         save_cache(parsed_data, expires_at)
 
         return {"success": True, "cached": False, "data": parsed_data}
@@ -470,13 +494,7 @@ async def generate_article(req: ArticleGenerateRequest):
         TUGAS UTAMA:
         Ubah TEKS UTAMA / FAKTA LEGIT dari user di bawah ini menjadi artikel berita jurnalistik yang utuh, profesional, dan kaya akan gaya penulisan taktis sepak bola.
 
-        ATURAN EDITORIAL KETAT (GROUND TRUTH / BEBAS HALUSINASI):
-        1. FAKTA & DATA: DILARANG MEMBUAT ATAU MENGARANG fakta baru, skor, tanggal, nama pemain, atau angka transfer yang TIDAK ADA pada Teks Sumber.
-        2. PENULISAN: Perluas kalimatnya, buat alur berita yang mengalir profesional, susun paragraf yang rapi, dan perjelas menggunakan istilah taktis sepak bola.
-        3. JUDUL: Buat judul yang sangat menarik, SEO-friendly (MAKSIMAL 110 KARAKTER).
-        4. EXCERPT: Buat meta description padat dan informatif (MAKSIMAL 160 KARAKTER).
-
-        INPUT USER (TEKS UTAMA / FAKTA LEGIT):
+        INPUT USER:
         ---
         {req.prompt}
         ---
@@ -503,9 +521,7 @@ async def generate_article(req: ArticleGenerateRequest):
 
     except Exception as e:
         print(f"[Generate Article Error]: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Gagal memproses artikel AI: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Gagal memproses artikel AI: {str(e)}")
 
 
 @app.post("/api/refine-field", response_model=FieldRefineResponse)
@@ -514,14 +530,8 @@ async def refine_field(req: FieldRefineRequest):
         prompt = f"""
         Kamu adalah Redaktur Berita Senior portal 'barcainspo®'.
         
-        TUGAS:
-        Berikan 3 variasi/revisi terbaik untuk komponen '{req.field_type}' artikel berita FC Barcelona.
-
-        NILAI SAAT INI:
-        "{req.current_value}"
-
-        INSTRUKSI REVISI / ARAHAN USER:
-        "{req.instruction}"
+        NILAI SAAT INI: "{req.current_value}"
+        INSTRUKSI REVISI: "{req.instruction}"
 
         KEMBALIKAN HANYA JSON MURNI DENGAN FORMAT:
         {{
@@ -540,9 +550,7 @@ async def refine_field(req: FieldRefineRequest):
 
     except Exception as e:
         print(f"[Refine Field Error]: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Gagal merevisi komponen: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Gagal merevisi komponen: {str(e)}")
 
 
 @app.post("/api/x-news/fetch", response_model=XNewsFetchResponse)
@@ -572,9 +580,6 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
                     timeout=15.0,
                 )
                 results = search_result.get("results", [])
-            except asyncio.TimeoutError:
-                print("⚠️ [Tavily Warning]: Search timed out after 15 seconds.")
-                results = []
             except Exception as t_err:
                 print(f"⚠️ [Tavily Error]: {t_err}")
                 results = []
@@ -582,18 +587,11 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
         if not results:
             return {"success": True, "count": 0, "leads": []}
 
-        raw_text = "\n\n".join([
-            f"Source URL ({item.get('url')}):\n{item.get('content')}"
-            for item in results
-        ])
+        raw_text = "\n\n".join([f"Source URL ({item.get('url')}):\n{item.get('content')}" for item in results])
 
         prompt = f"""
         Hari ini adalah tanggal {current_date_str} (ISO: {today_iso}).
-        Kamu adalah Head Editor Berita Utama untuk portal berita olahraga 'barcainspo®'.
-
-        TUGAS UTAMA:
-        Analisis teks mentah hasil pemantauan dari X (Twitter) berikut ini.
-        Saring HANYA cuitan yang MEMILIKI VALUE BERITA UTAMA FC BARCELONA dan SANGAT LAYAK DIBAWA KE DRAFT ARTIKEL.
+        Kamu adalah Head Editor Berita Utama untuk portal 'barcainspo®'.
 
         DATA MENTAH DARI X:
         ---
@@ -605,10 +603,10 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
             "leads": [
                 {{
                     "sourceHandle": "@{clean_handles[0]}",
-                    "headline": "Judul berita yang padat, menarik, dan informatif dalam Bahasa Indonesia",
-                    "summary": "Ringkasan poin-poin fakta utama berita dalam Bahasa Indonesia (2-3 kalimat)",
-                    "rawContent": "Kutipan teks asli dari cuitan tersebut",
-                    "tweetUrl": "URL sumber asli dari data di atas jika ada",
+                    "headline": "Judul berita yang padat",
+                    "summary": "Ringkasan poin-poin fakta utama",
+                    "rawContent": "Kutipan teks asli",
+                    "tweetUrl": "URL sumber asli",
                     "createdAt": "{today_iso}"
                 }}
             ]
@@ -616,46 +614,23 @@ async def fetch_x_news_leads(req: XNewsFetchRequest):
         """
 
         try:
-            raw_response = await asyncio.wait_for(
-                call_gemini_with_fallback(prompt),
-                timeout=30.0
-            )
+            raw_response = await asyncio.wait_for(call_gemini_with_fallback(prompt), timeout=30.0)
             cleaned_response = clean_json_string(raw_response)
             parsed_data = json.loads(cleaned_response)
             leads_data = parsed_data.get("leads", [])
             if not isinstance(leads_data, list):
                 leads_data = []
-        except Exception as llm_err:
-            print(f"⚠️ [LLM Parsing Fallback]: {llm_err}")
+        except Exception:
             leads_data = []
-            for item in results[:3]:
-                leads_data.append({
-                    "sourceHandle": f"@{clean_handles[0]}",
-                    "headline": item.get("title", "Update Berita Terkini FC Barcelona"),
-                    "summary": item.get("content", "")[:200] + "...",
-                    "rawContent": item.get("content", ""),
-                    "tweetUrl": item.get("url", ""),
-                    "createdAt": today_iso,
-                })
 
-        return {
-            "success": True,
-            "count": len(leads_data),
-            "leads": leads_data
-        }
+        return {"success": True, "count": len(leads_data), "leads": leads_data}
 
     except Exception as e:
-        print(f"[X-News Agent Error Handled]: {e}")
-        return {
-            "success": False,
-            "count": 0,
-            "leads": []
-        }
+        return {"success": False, "count": 0, "leads": []}
 
-FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
 
 # ==========================================
-# ENDPOINT KLASEMEN LA LIGA (FOOTBALL-DATA.ORG + REDIS 30 MIN)
+# ENDPOINT KLASEMEN LA LIGA (FOOTBALL-DATA.ORG)
 # ==========================================
 @app.get("/api/standings")
 async def get_la_liga_standings():
@@ -680,13 +655,13 @@ async def get_la_liga_standings():
             except Exception as e:
                 print(f"[Standings Cache Load Error]: {e}")
 
-        # 2. FETCH KE FOOTBALL-DATA.ORG ('PD' = Primera Division / La Liga)
+        # 2. FETCH KE FOOTBALL-DATA.ORG
         if not FOOTBALL_DATA_API_KEY:
             raise HTTPException(
                 status_code=500, detail="FOOTBALL_DATA_API_KEY belum terpasang di .env"
             )
 
-        url = "https://api.football-data.org/v4/competitions/PD/standings"
+        url = "[https://api.football-data.org/v4/competitions/PD/standings](https://api.football-data.org/v4/competitions/PD/standings)"
         req = urllib.request.Request(
             url,
             headers={
@@ -715,7 +690,7 @@ async def get_la_liga_standings():
                     "points": item.get("points"),
                 })
 
-        # 3. SIMPAN KE REDIS (EXPIRE 30 MENIT)
+        # 3. SIMPAN KE REDIS (30 MENIT)
         if standings_list:
             expires_at = now + timedelta(minutes=30)
             cache_payload = {
