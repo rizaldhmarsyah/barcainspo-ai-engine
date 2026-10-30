@@ -305,7 +305,10 @@ async def call_gemini_with_fallback(prompt: str) -> str:
                     client.models.generate_content,
                     model=model_name,
                     contents=prompt,
-                    config={"response_mime_type": "application/json"},
+                    config={
+                        "response_mime_type": "application/json",
+                        "max_output_tokens": 8192,
+                    },
                 )
                 if response and response.text:
                     return response.text
@@ -886,19 +889,6 @@ async def generate_season_schedule():
         }}
         """
 
-        raw_response = await call_gemini_with_fallback(prompt)
-        cleaned_response = clean_json_string(raw_response)
-
-        try:
-            parsed = json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", cleaned_response, re.DOTALL)
-            if not match:
-                raise ValueError("Respons AI bukan JSON yang valid.")
-            parsed = json.loads(match.group(0))
-
-        items = parsed if isinstance(parsed, list) else parsed.get("matches", [])
-
         def to_score(value):
             if value is None or value == "":
                 return None
@@ -908,59 +898,126 @@ async def generate_season_schedule():
                 return None
             return number if number >= 0 else None
 
+        def parse_items(raw: str) -> list:
+            cleaned = clean_json_string(raw)
+            parsed = None
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError:
+                match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+                if match:
+                    try:
+                        parsed = json.loads(match.group(0))
+                    except json.JSONDecodeError:
+                        parsed = None
+
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for key in ("matches", "fixtures", "schedule", "data", "results"):
+                    value = parsed.get(key)
+                    if isinstance(value, list):
+                        return value
+                for value in parsed.values():
+                    if (
+                        isinstance(value, list)
+                        and value
+                        and isinstance(value[0], dict)
+                    ):
+                        return value
+            return []
+
+        def normalize(items: list) -> list:
+            rows = []
+            seen = set()
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                opponent = str(
+                    item.get("opponent")
+                    or item.get("rival")
+                    or item.get("team")
+                    or ""
+                ).strip()
+                kickoff_utc = madrid_local_to_utc(
+                    item.get("kickoff_local")
+                    or item.get("kickoff_at")
+                    or item.get("kickoff")
+                    or item.get("match_iso")
+                    or item.get("date")
+                    or item.get("utcDate")
+                    or ""
+                )
+                if not opponent or not kickoff_utc:
+                    continue
+
+                venue_raw = str(item.get("venue") or "Home").strip().lower()
+                if venue_raw.startswith("away") or venue_raw in ("tandang", "a"):
+                    venue = "Away"
+                elif "neutral" in venue_raw or venue_raw in ("netral", "n"):
+                    venue = "Neutral"
+                else:
+                    venue = "Home"
+
+                status_raw = str(item.get("status") or "").strip().lower()
+                if status_raw not in ("scheduled", "finished", "postponed"):
+                    kickoff_dt = datetime.fromisoformat(
+                        kickoff_utc.replace("Z", "+00:00")
+                    )
+                    status = "finished" if kickoff_dt < now else "scheduled"
+                else:
+                    status = status_raw
+
+                dedupe_key = (opponent.lower(), kickoff_utc)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+
+                opponent_code = (
+                    str(item.get("opponent_code") or "").strip().upper()[:5]
+                )
+
+                rows.append(
+                    {
+                        "season": season_label,
+                        "competition": str(
+                            item.get("competition") or "La Liga"
+                        ).strip()
+                        or "La Liga",
+                        "opponent": opponent,
+                        "opponent_code": opponent_code or get_team_code(opponent),
+                        "opponent_logo": get_static_team_logo(opponent),
+                        "venue": venue,
+                        "kickoff_at": kickoff_utc,
+                        "status": status,
+                        "home_score": to_score(item.get("home_score")),
+                        "away_score": to_score(item.get("away_score")),
+                    }
+                )
+
+            rows.sort(key=lambda row: row["kickoff_at"])
+            return rows
+
         normalized = []
-        seen = set()
-
-        for item in items if isinstance(items, list) else []:
-            if not isinstance(item, dict):
-                continue
-
-            opponent = str(item.get("opponent") or "").strip()
-            kickoff_utc = madrid_local_to_utc(
-                item.get("kickoff_local") or item.get("match_iso") or ""
+        retry_note = ""
+        for attempt in range(1, 4):
+            raw_response = await call_gemini_with_fallback(prompt + retry_note)
+            items = parse_items(raw_response)
+            normalized = normalize(items)
+            print(
+                f"[Season Schedule] attempt {attempt}: "
+                f"raw={len(raw_response)} chars, items={len(items)}, "
+                f"valid={len(normalized)}"
             )
-            if not opponent or not kickoff_utc:
-                continue
-
-            venue_raw = str(item.get("venue") or "Home").strip().lower()
-            if venue_raw.startswith("away") or venue_raw in ("tandang", "a"):
-                venue = "Away"
-            elif "neutral" in venue_raw or venue_raw in ("netral", "n"):
-                venue = "Neutral"
-            else:
-                venue = "Home"
-
-            status_raw = str(item.get("status") or "").strip().lower()
-            if status_raw not in ("scheduled", "finished", "postponed"):
-                kickoff_dt = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
-                status = "finished" if kickoff_dt < now else "scheduled"
-            else:
-                status = status_raw
-
-            dedupe_key = (opponent.lower(), kickoff_utc)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-
-            opponent_code = str(item.get("opponent_code") or "").strip().upper()[:5]
-
-            normalized.append(
-                {
-                    "season": season_label,
-                    "competition": str(item.get("competition") or "La Liga").strip()
-                    or "La Liga",
-                    "opponent": opponent,
-                    "opponent_code": opponent_code or get_team_code(opponent),
-                    "opponent_logo": get_static_team_logo(opponent),
-                    "venue": venue,
-                    "kickoff_at": kickoff_utc,
-                    "status": status,
-                    "home_score": to_score(item.get("home_score")),
-                    "away_score": to_score(item.get("away_score")),
-                }
+            if normalized:
+                break
+            retry_note = (
+                "\n\nPERCOBAAN ULANG: respons sebelumnya tidak valid. "
+                "Keluarkan JSON murni dengan minimal 30 pertandingan pada "
+                'array "matches" sesuai skema di atas.'
             )
-
-        normalized.sort(key=lambda row: row["kickoff_at"])
 
         if not normalized:
             raise ValueError("AI tidak menghasilkan jadwal yang valid.")
