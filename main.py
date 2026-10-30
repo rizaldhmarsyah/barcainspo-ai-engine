@@ -2,11 +2,13 @@ import os
 import re
 import json
 import asyncio
+import unicodedata
 import warnings
 import urllib.parse
 import urllib.request
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -123,6 +125,69 @@ KNOWN_LOGOS = {
     "manchester city": "https://crests.football-data.org/65.png",
     "arsenal": "https://crests.football-data.org/57.png",
 }
+
+
+# PETA LOGO TIM LA LIGA (tanpa panggilan API eksternal)
+LA_LIGA_LOGOS = {
+    "alaves": "https://crests.football-data.org/263.png",
+    "athletic": "https://crests.football-data.org/77.png",
+    "atletico": "https://crests.football-data.org/78.png",
+    "espanyol": "https://crests.football-data.org/80.png",
+    "getafe": "https://crests.football-data.org/82.png",
+    "osasuna": "https://crests.football-data.org/79.png",
+    "malaga": "https://crests.football-data.org/84.png",
+    "rayo": "https://crests.football-data.org/87.png",
+    "levante": "https://crests.football-data.org/88.png",
+    "mallorca": "https://crests.football-data.org/89.png",
+    "realsociedad": "https://crests.football-data.org/92.png",
+    "valencia": "https://crests.football-data.org/95.png",
+    "valladolid": "https://crests.football-data.org/250.png",
+    "laspalmas": "https://crests.football-data.org/275.png",
+    "elche": "https://crests.football-data.org/285.png",
+    "celta": "https://crests.football-data.org/558.png",
+    "deportivo": "https://crests.football-data.org/560.png",
+    "leganes": "https://crests.football-data.org/745.png",
+}
+
+# PETA LOGO KLUB EROPA LAIN (lawan UCL / laga netral)
+EURO_LOGOS = {
+    "feyenoord": "https://crests.football-data.org/675.png",
+    "astonvilla": "https://crests.football-data.org/58.png",
+    "sporting": "https://crests.football-data.org/498.png",
+    "como": "https://crests.football-data.org/457.png",
+    "inter": "https://crests.football-data.org/108.png",
+    "chelsea": "https://crests.football-data.org/61.png",
+    "dortmund": "https://crests.football-data.org/4.png",
+    "leverkusen": "https://crests.football-data.org/3.png",
+    "benfica": "https://crests.football-data.org/1903.png",
+    "psg": "https://crests.football-data.org/524.png",
+    "mancity": "https://crests.football-data.org/65.png",
+    "arsenal": "https://crests.football-data.org/57.png",
+    "bayern": "https://crests.football-data.org/5.png",
+}
+
+
+def _fold_name(value: str) -> str:
+    """Huruf kecil tanpa aksen dan tanpa spasi: 'Atlético' -> 'atletico'."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    return (
+        "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        .strip()
+        .lower()
+        .replace(" ", "")
+    )
+
+
+def get_static_team_logo(team_name: Optional[str]) -> Optional[str]:
+    """Logo dari kamus lokal saja (cepat, tanpa request HTTP)."""
+    if not team_name:
+        return None
+    clean_name = _fold_name(team_name)
+    for mapping in (KNOWN_LOGOS, LA_LIGA_LOGOS, EURO_LOGOS):
+        for key, logo_url in mapping.items():
+            if _fold_name(key) in clean_name:
+                return logo_url
+    return None
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
@@ -703,4 +768,210 @@ async def get_la_liga_standings():
 
     except Exception as e:
         print(f"[Football-Data Standings Error]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ENDPOINT JADWAL SATU MUSIM (AI)
+# ==========================================
+MADRID_TZ = "Europe/Madrid"
+
+
+def _last_sunday(year: int, month: int) -> date:
+    last_day = date(year, month, 31)
+    return last_day - timedelta(days=(last_day.weekday() + 1) % 7)
+
+
+def madrid_local_to_utc(value: str) -> Optional[str]:
+    """Konversi waktu dinding Eropa/Madrid (tanpa offset) menjadi ISO UTC."""
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1]
+    text = text.replace(" ", "T")
+
+    try:
+        naive = datetime.fromisoformat(text[:19])
+    except ValueError:
+        return None
+
+    try:
+        local = naive.replace(tzinfo=ZoneInfo(MADRID_TZ))
+    except (ZoneInfoNotFoundError, ValueError):
+        dst_start = datetime.combine(_last_sunday(naive.year, 3), time(1, 0))
+        dst_end = datetime.combine(_last_sunday(naive.year, 10), time(1, 0))
+        offset = timedelta(hours=2) if dst_start <= naive < dst_end else timedelta(hours=1)
+        local = naive.replace(tzinfo=timezone(offset))
+
+    return local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@app.post("/api/season-schedule")
+async def generate_season_schedule():
+    try:
+        now = datetime.now(timezone.utc)
+        season_start = now.year if now.month >= 7 else now.year - 1
+        season_label = f"{season_start}/{str(season_start + 1)[-2:]}"
+        today_str = now.strftime("%d %B %Y")
+
+        search_query = (
+            f"FC Barcelona {season_label} full fixture list all competitions "
+            f"La Liga Champions League Copa del Rey results kick off dates"
+        )
+
+        results = []
+        if tavily:
+            try:
+                search_result = await asyncio.to_thread(
+                    tavily.search,
+                    query=search_query,
+                    max_results=8,
+                    search_depth="advanced",
+                )
+                results = search_result.get("results", [])
+            except Exception as t_err:
+                print(f"[Season Schedule Tavily Warning]: {t_err}")
+
+        raw_text = (
+            "\n\n".join(
+                [
+                    f"Source ({item.get('url')}):\n{item.get('content')}"
+                    for item in results
+                ]
+            )
+            if results
+            else "Data pencarian web tidak tersedia."
+        )
+
+        prompt = f"""
+        Hari ini adalah {today_str}. Musim yang diminta: {season_label}.
+
+        TUGAS:
+        Susun DAFTAR LENGKAP SEMUA pertandingan resmi FC Barcelona (tim utama pria) pada musim {season_label}.
+        Wajib mencakup seluruh kompetisi resmi: La Liga, UEFA Champions League, Copa del Rey, dan Supercopa de España.
+        Sertakan pertandingan yang SUDAH dimainkan (status finished, lengkap dengan skor) dan
+        pertandingan yang AKAN datang (status scheduled). Jangan sertakan laga persahabatan.
+
+        ATURAN DATA:
+        1. "opponent" = nama klub lawan.
+        2. "opponent_code" = singkatan resmi 3 huruf.
+        3. "venue" = "Home" jika Barcelona tuan rumah, "Away" jika tandang, "Neutral" jika di tempat netral.
+        4. "kickoff_local" = waktu kick-off zona Eropa/Madrid TANPA offset, format YYYY-MM-DDTHH:MM:SS.
+        5. "status" = "scheduled" | "finished" | "postponed".
+        6. "home_score" / "away_score" = skor pertandingan (home vs away) atau null jika belum dimainkan.
+        7. Urutkan pertandingan secara kronologis.
+        8. Gunakan data dari pencarian web di bawah dan jangan mengarang kompetisi di luar daftar resmi.
+
+        DATA MENTAH PENCARIAN WEB:
+        ---
+        {raw_text}
+        ---
+
+        KELUARKAN HANYA JSON MURNI DENGAN STRUKTUR:
+        {{
+          "season": "{season_label}",
+          "matches": [
+            {{
+              "opponent": "Real Madrid CF",
+              "opponent_code": "RMA",
+              "competition": "La Liga",
+              "venue": "Home",
+              "kickoff_local": "2026-10-25T21:00:00",
+              "status": "scheduled",
+              "home_score": null,
+              "away_score": null
+            }}
+          ]
+        }}
+        """
+
+        raw_response = await call_gemini_with_fallback(prompt)
+        cleaned_response = clean_json_string(raw_response)
+
+        try:
+            parsed = json.loads(cleaned_response)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned_response, re.DOTALL)
+            if not match:
+                raise ValueError("Respons AI bukan JSON yang valid.")
+            parsed = json.loads(match.group(0))
+
+        items = parsed if isinstance(parsed, list) else parsed.get("matches", [])
+
+        def to_score(value):
+            if value is None or value == "":
+                return None
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return None
+            return number if number >= 0 else None
+
+        normalized = []
+        seen = set()
+
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+
+            opponent = str(item.get("opponent") or "").strip()
+            kickoff_utc = madrid_local_to_utc(
+                item.get("kickoff_local") or item.get("match_iso") or ""
+            )
+            if not opponent or not kickoff_utc:
+                continue
+
+            venue_raw = str(item.get("venue") or "Home").strip().lower()
+            if venue_raw.startswith("away") or venue_raw in ("tandang", "a"):
+                venue = "Away"
+            elif "neutral" in venue_raw or venue_raw in ("netral", "n"):
+                venue = "Neutral"
+            else:
+                venue = "Home"
+
+            status_raw = str(item.get("status") or "").strip().lower()
+            if status_raw not in ("scheduled", "finished", "postponed"):
+                kickoff_dt = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
+                status = "finished" if kickoff_dt < now else "scheduled"
+            else:
+                status = status_raw
+
+            dedupe_key = (opponent.lower(), kickoff_utc)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            opponent_code = str(item.get("opponent_code") or "").strip().upper()[:5]
+
+            normalized.append(
+                {
+                    "season": season_label,
+                    "competition": str(item.get("competition") or "La Liga").strip()
+                    or "La Liga",
+                    "opponent": opponent,
+                    "opponent_code": opponent_code or get_team_code(opponent),
+                    "opponent_logo": get_static_team_logo(opponent),
+                    "venue": venue,
+                    "kickoff_at": kickoff_utc,
+                    "status": status,
+                    "home_score": to_score(item.get("home_score")),
+                    "away_score": to_score(item.get("away_score")),
+                }
+            )
+
+        normalized.sort(key=lambda row: row["kickoff_at"])
+
+        if not normalized:
+            raise ValueError("AI tidak menghasilkan jadwal yang valid.")
+
+        return {
+            "success": True,
+            "season": season_label,
+            "count": len(normalized),
+            "data": normalized,
+        }
+
+    except Exception as e:
+        print(f"[Season Schedule API Error]: {e}")
         raise HTTPException(status_code=500, detail=str(e))
