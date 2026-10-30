@@ -108,27 +108,27 @@ def get_team_code(team_name: str) -> str:
 
 # PETA LOGO KILAT (Direct CDN High-Res)
 KNOWN_LOGOS = {
-    "paris saint-germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
-    "paris saint germain": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
-    "psg": "[https://crests.football-data.org/524.png](https://crests.football-data.org/524.png)",
-    "real madrid": "[https://crests.football-data.org/86.png](https://crests.football-data.org/86.png)",
-    "galatasaray": "[https://crests.football-data.org/610.png](https://crests.football-data.org/610.png)",
-    "real betis": "[https://crests.football-data.org/90.png](https://crests.football-data.org/90.png)",
-    "betis": "[https://crests.football-data.org/90.png](https://crests.football-data.org/90.png)",
-    "atletico madrid": "[https://crests.football-data.org/78.png](https://crests.football-data.org/78.png)",
-    "girona": "[https://crests.football-data.org/298.png](https://crests.football-data.org/298.png)",
-    "sevilla": "[https://crests.football-data.org/559.png](https://crests.football-data.org/559.png)",
-    "villarreal": "[https://crests.football-data.org/94.png](https://crests.football-data.org/94.png)",
-    "bayern munich": "[https://crests.football-data.org/5.png](https://crests.football-data.org/5.png)",
-    "manchester city": "[https://crests.football-data.org/65.png](https://crests.football-data.org/65.png)",
-    "arsenal": "[https://crests.football-data.org/57.png](https://crests.football-data.org/57.png)",
+    "paris saint-germain": "https://crests.football-data.org/524.png",
+    "paris saint germain": "https://crests.football-data.org/524.png",
+    "psg": "https://crests.football-data.org/524.png",
+    "real madrid": "https://crests.football-data.org/86.png",
+    "galatasaray": "https://crests.football-data.org/610.png",
+    "real betis": "https://crests.football-data.org/90.png",
+    "betis": "https://crests.football-data.org/90.png",
+    "atletico madrid": "https://crests.football-data.org/78.png",
+    "girona": "https://crests.football-data.org/298.png",
+    "sevilla": "https://crests.football-data.org/559.png",
+    "villarreal": "https://crests.football-data.org/94.png",
+    "bayern munich": "https://crests.football-data.org/5.png",
+    "manchester city": "https://crests.football-data.org/65.png",
+    "arsenal": "https://crests.football-data.org/57.png",
 }
 
 
 def get_team_logo_dynamic(team_name: str) -> str:
     """Mengambil logo tim dengan prioritas Kamus Kilat -> API-Football -> Fallback Avatar."""
     if not team_name:
-        return "[https://crests.football-data.org/724.png](https://crests.football-data.org/724.png)"
+        return "https://crests.football-data.org/724.png"
 
     clean_name = team_name.strip().lower()
 
@@ -141,7 +141,7 @@ def get_team_logo_dynamic(team_name: str) -> str:
     if API_FOOTBALL_KEY:
         try:
             encoded_name = urllib.parse.quote(team_name.strip())
-            url = f"[https://v3.football.api-sports.io/teams?search=](https://v3.football.api-sports.io/teams?search=){encoded_name}"
+            url = f"https://v3.football.api-sports.io/teams?search={encoded_name}"
             req = urllib.request.Request(
                 url,
                 headers={
@@ -162,7 +162,7 @@ def get_team_logo_dynamic(team_name: str) -> str:
 
     # 3. Fallback Terakhir
     encoded_avatar = urllib.parse.quote(team_name.strip())
-    return f"[https://ui-avatars.com/api/?name=](https://ui-avatars.com/api/?name=){encoded_avatar}&background=000000&color=ffffff&bold=true"
+    return f"https://ui-avatars.com/api/?name={encoded_avatar}&background=000000&color=ffffff&bold=true"
 
 
 # ==========================================
@@ -448,7 +448,7 @@ async def get_next_match():
             get_team_logo_dynamic, opponent_name
         )
 
-        parsed_data["barca_logo"] = "[https://crests.football-data.org/81.png](https://crests.football-data.org/81.png)"
+        parsed_data["barca_logo"] = "https://crests.football-data.org/81.png"
         parsed_data["opponent_logo"] = opponent_logo_url
 
         # 4. LOGIKA SMART CACHE
@@ -657,7 +657,7 @@ async def get_la_liga_standings():
                 status_code=500, detail="FOOTBALL_DATA_API_KEY belum terpasang di .env"
             )
 
-        url = "[https://api.football-data.org/v4/competitions/PD/standings](https://api.football-data.org/v4/competitions/PD/standings)"
+        url = "https://api.football-data.org/v4/competitions/PD/standings"
         req = urllib.request.Request(
             url,
             headers={
